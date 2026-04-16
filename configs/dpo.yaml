@@ -1,0 +1,41 @@
+# Margin-aware DPO training configuration
+# All keys correspond to DPOTrainConfig dataclass field names.
+# Override any key on the command line: --beta 0.2 --alpha 2.0
+
+model_name_or_path:     "outputs/sft"
+ref_model_name_or_path: null          # null = use frozen copy of policy model
+
+# ── data paths (fill in before running) ──────────────────────────────────────
+dpo_pairs_path: "data/dpo_pairs.jsonl"
+output_dir:     "outputs/dpo"
+
+# ── DPO hyper-parameters ──────────────────────────────────────────────────────
+beta:  0.1    # KL penalty: lower → stay closer to reference model
+alpha: 1.0    # margin weight in loss: L = -log σ(β*(r_w−r_l) + α*margin)
+              # higher α → large-margin pairs contribute more to training
+
+# ── training hyper-parameters ─────────────────────────────────────────────────
+num_train_epochs:            1
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8       # effective batch = 2 * 8 = 16
+learning_rate:               5.0e-6  # 2 orders of magnitude below SFT lr
+warmup_ratio:                0.1
+lr_scheduler_type:           "cosine"
+max_seq_length:              2048
+max_prompt_length:           1536
+eval_split:                  0.05    # 5 % of pairs used for evaluation
+
+# ── LoRA (continue from SFT LoRA, do not merge) ───────────────────────────────
+use_lora:            true
+lora_r:              16
+lora_alpha:          32
+lora_dropout:        0.05
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# ── misc ──────────────────────────────────────────────────────────────────────
+bf16:                   true
+fp16:                   false
+seed:                   42
+logging_steps:          10
+save_steps:             100
+dataloader_num_workers: 2

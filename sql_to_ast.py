@@ -1,13 +1,17 @@
-"""Parse SQL statements into serializable sqlglot AST trees.
+"""Normalize SQL statements and store the canonical string form.
 
 The primary input format is an eval result JSON file, such as
 ``eval_results/544_movies_4_eval.json``. For these files, the script reads
 ``gold_sql``, ``correct_set[*].sql``, and ``wrong_set[*].sql`` and writes one
 JSON payload per query with ``gold``, ``correct``, and ``wrong`` lists
-containing SQL plus AST data.
+containing the original SQL and its normalized form.
+
+The normalized SQL is produced by parsing with sqlglot and re-serializing,
+which gives a consistent representation suitable for deduplication and for
+re-parsing into a live Expression object when distance metrics are needed.
 
 The legacy sampled SQL format is still supported: JSON records with an
-``all_sqls`` list are preserved and receive an ``ast_sqls`` list.
+``all_sqls`` list are preserved and receive a ``normalized_sqls`` list.
 
 The CLI supports either one JSON file or a directory of JSON files.
 """
@@ -29,44 +33,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised by CLI users
     ) from exc
 
 
-JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
-
-
-def expression_to_dict(node: Any) -> JsonValue:
-    """Convert a sqlglot Expression tree into plain JSON-compatible data."""
-    if isinstance(node, exp.Expression):
-        args = {
-            key: expression_to_dict(value)
-            for key, value in node.args.items()
-            if value is not None
-        }
-
-        tree: dict[str, Any] = {"type": node.__class__.__name__}
-        if args:
-            tree["args"] = args
-        return tree
-
-    if isinstance(node, list):
-        return [expression_to_dict(item) for item in node]
-
-    if isinstance(node, tuple):
-        return [expression_to_dict(item) for item in node]
-
-    if isinstance(node, (str, int, float, bool)) or node is None:
-        return node
-
-    return str(node)
-
-
 def parse_sql(sql: str, dialect: str | None = None) -> dict[str, Any]:
-    """Parse one SQL statement and return the original SQL plus its AST."""
+    """Parse one SQL statement and return the original SQL plus its normalized form."""
     expression = sqlglot.parse_one(sql, read=dialect) if dialect else sqlglot.parse_one(sql)
     normalized_sql = expression.sql(dialect=dialect) if dialect else expression.sql()
 
     return {
         "sql": sql,
         "normalized_sql": normalized_sql,
-        "ast": expression_to_dict(expression),
     }
 
 
@@ -296,7 +270,7 @@ def parse_dataset(
 
     parsed = {
         **data,
-        "ast_sqls": [
+        "normalized_sqls": [
             parse_sql_safely(sql, dialect=dialect)
             for sql in selected_sqls
         ],

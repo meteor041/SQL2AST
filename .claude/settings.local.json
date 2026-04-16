@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(type\\(d\\)\\); print\\(json.dumps\\(d[0] if isinstance\\(d,list\\) else d, ensure_ascii=False, indent=2\\)[:2000]\\)\")"
+    ]
+  }
+}

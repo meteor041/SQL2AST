@@ -1,0 +1,35 @@
+# SFT warm-up training configuration
+# All keys correspond to SFTConfig dataclass field names.
+# Override any key on the command line: --learning_rate 1e-4
+
+model_name_or_path: "Qwen/Qwen2.5-Coder-7B-Instruct"
+
+# ── data paths (fill in before running) ──────────────────────────────────────
+train_data_path: "/data/bird/train/train.json"
+database_root:   "/data/bird/train/train_databases"
+output_dir:      "outputs/sft"
+
+# ── training hyper-parameters ─────────────────────────────────────────────────
+num_train_epochs:            3
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4      # effective batch = 4 * 4 = 16
+learning_rate:               2.0e-5
+warmup_ratio:                0.05
+lr_scheduler_type:           "cosine"
+max_seq_length:              2048
+
+# ── LoRA ──────────────────────────────────────────────────────────────────────
+use_lora:            true
+lora_r:              16
+lora_alpha:          32
+lora_dropout:        0.05
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# ── misc ──────────────────────────────────────────────────────────────────────
+bf16:                   true
+fp16:                   false
+seed:                   42
+logging_steps:          10
+save_steps:             200
+eval_steps:             200
+dataloader_num_workers: 4
