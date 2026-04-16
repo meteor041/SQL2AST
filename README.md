@@ -117,7 +117,7 @@ Print a single converted file to stdout:
 python sql_to_ast.py eval_results/544_movies_4_eval.json --dialect sqlite
 ```
 
-Expected eval AST output:
+Expected output:
 
 ```json
 {
@@ -137,27 +137,27 @@ Expected eval AST output:
   "gold": [
     {
       "sql": "...",
-      "normalized_sql": "...",
-      "ast": {}
+      "normalized_sql": "..."
     }
   ],
   "correct": [
     {
       "sql": "...",
-      "normalized_sql": "...",
-      "ast": {}
+      "normalized_sql": "..."
     }
   ],
   "wrong": [
     {
       "sql": "...",
-      "normalized_sql": "...",
-      "ast": {}
+      "normalized_sql": "..."
     }
   ],
   "errors": []
 }
 ```
+
+Each `normalized_sql` is produced by parsing with sqlglot and re-serializing.
+To compute distance metrics, re-parse it with `sqlglot.parse_one(normalized_sql)`.
 
 For directory input, files are mapped like this:
 
@@ -165,7 +165,7 @@ For directory input, files are mapped like this:
 eval_results/544_movies_4_eval.json -> eval_results_ast/544_movies_4_ast.json
 ```
 
-## 5. Legacy `all_sqls` to AST
+## 5. Legacy `all_sqls` normalization
 
 `sql_to_ast.py` still supports the old sampled SQL format directly:
 
@@ -173,7 +173,8 @@ eval_results/544_movies_4_eval.json -> eval_results_ast/544_movies_4_ast.json
 python sql_to_ast.py data/1_movie_platform.json -o data_ast/1_movie_platform_ast.json --dialect sqlite
 ```
 
-This preserves the original records and adds `ast_sqls`.
+This preserves the original records and adds `normalized_sqls` (a list of
+`{"sql": "...", "normalized_sql": "..."}` objects, one per unique SQL string).
 
 ## 6. Typical Full Workflow
 
@@ -188,4 +189,4 @@ python sql_to_ast.py eval_results -o eval_results_ast --pattern '*_eval.json' --
 After this workflow:
 
 - `eval_results/` contains execution-evaluation results.
-- `eval_results_ast/` contains gold/correct/wrong SQL plus AST JSON.
+- `eval_results_ast/` contains gold/correct/wrong SQL with normalized forms.
