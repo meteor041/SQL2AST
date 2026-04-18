@@ -1,192 +1,568 @@
-# SQL Evaluation and AST Export
+# SQL2AST 数据处理与训练指南
 
-This repository has two main scripts:
+本文档面向 Linux 云服务器环境，按“数据准备 -> 候选 SQL 执行评估 -> AST/距离处理 -> SFT -> DPO”的顺序说明完整流程。示例默认运行环境为 8 张 A100 40G，训练阶段建议使用多卡启动。
 
-- `eval.py`: evaluate generated SQL candidates against gold SQL by executing them on SQLite databases.
-- `sql_to_ast.py`: convert SQL in JSON files into sqlglot AST JSON.
+## 1. 项目功能概览
 
-## 1. Install Dependencies
+仓库中主要包含 5 类脚本：
+
+- `eval.py`
+  将候选 SQL 在对应 SQLite 数据库上执行，并与 gold SQL 的执行结果比较，输出 `correct_set` 和 `wrong_set`。
+- `sql_to_ast.py`
+  将 `eval.py` 的输出转换为规范化 SQL / AST 结果，方便分析与调试。
+- `src/calibrate.py`
+  统计 AST 距离与执行正确性的相关性，用于检查距离函数是否可靠。
+- `src/build_pairs.py`
+  基于 `eval_results` 构造 DPO 所需的偏好数据 `dpo_pairs.jsonl`。
+- `src/train_sft.py` / `src/train_dpo.py`
+  分别进行 SFT 训练和 DPO 训练。
+
+其中：
+
+- `eval.py` 决定候选 SQL “执行上对不对”
+- `src/distance/*` 决定候选 SQL “结构上离 gold 有多近”
+- `src/train_sft.py` 先让模型学会基础 NL2SQL
+- `src/train_dpo.py` 再让模型偏向更优候选
+
+## 2. 推荐运行环境
+
+### 2.1 硬件
+
+- GPU: 8 x A100 40G
+- CPU: 建议 32 核及以上
+- 内存: 建议 128 GB 及以上
+- 磁盘: 建议至少 500 GB 可用空间
+
+### 2.2 软件
+
+- Linux x86_64
+- Python 3.10 或 3.11
+- CUDA 11.8 或 12.x
+- 建议使用 `conda` 或 `venv`
+
+### 2.3 Python 依赖
+
+仓库中的 `requirements.txt` 目前只包含：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-The required parser dependency is `sqlglot`.
+这只会安装 `sqlglot`，足够运行 AST 相关脚本，但不足以直接训练。若要完整跑通 SFT / DPO，建议额外安装：
 
-## 2. Configure `.location`
-
-Create or edit `.location` in the repository root:
-
-```ini
-TRAIN_DATA_PATH=/data/huwenp/emb/data/ches/train.json
-TRAIN_DATABASE_PATH=/data/huwenp/emb/data/ches/train_databases
-SQL_PATH=/data/huwenp/emb/data/ches/candidates/16_qwen7B_train
-EVAL_OUTPUT_PATH=eval_results
+```bash
+pip install pyyaml datasets transformers peft trl accelerate sentencepiece
+pip install scipy scikit-learn
 ```
 
-Required keys:
+再根据你的 CUDA 版本安装 PyTorch。以 CUDA 11.8 为例：
 
-- `TRAIN_DATA_PATH`: train JSON containing gold SQL and `db_id`.
-- `TRAIN_DATABASE_PATH`: directory containing SQLite databases.
-- `SQL_PATH`: candidate SQL JSON file or directory.
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
 
-Optional key:
+如果服务器环境由平台统一维护，也可以使用平台预装的 PyTorch。
 
-- `EVAL_OUTPUT_PATH`: output directory for `eval.py`. Defaults to `eval_results` if not set.
+## 3. 数据目录约定
 
-Candidate SQL files should be named like:
+建议在服务器上准备如下目录结构：
+
+```text
+/data/sql2ast/
+├── train/
+│   ├── train.json
+│   └── train_databases/
+│       ├── db1.sqlite
+│       └── db2/
+│           └── db2.sqlite
+├── candidates/
+│   ├── 0_xxx.json
+│   ├── 1_xxx.json
+│   └── ...
+├── eval_results/
+├── eval_results_ast/
+├── reports/
+└── outputs/
+    ├── sft/
+    └── dpo/
+```
+
+### 3.1 `train.json`
+
+训练集中的每条样本至少应包含这些字段：
+
+- `question`
+- `db_id`
+- `SQL`
+- `evidence`
+
+其中：
+
+- `question` 是自然语言问题
+- `db_id` 是数据库标识
+- `SQL` 是 gold SQL
+- `evidence` 可以为空字符串
+
+### 3.2 候选 SQL 文件
+
+每个候选文件名必须能从前缀提取 `sample_id`，例如：
 
 ```text
 544_movies_4.json
 ```
 
-Each file should contain records with an `all_sqls` list.
-
-## 3. Run `eval.py`
-
-Evaluate all candidate files configured by `.location`:
-
-```bash
-python eval.py
-```
-
-Write results to a custom directory:
-
-```bash
-python eval.py --output-dir eval_results
-```
-
-Evaluate a specific candidate file or directory:
-
-```bash
-python eval.py --input-dir data/1_movie_platform.json --output-dir eval_results
-```
-
-Limit the number of files for a quick smoke test:
-
-```bash
-python eval.py --limit 5 --output-dir eval_results
-```
-
-Use more CPU workers:
-
-```bash
-python eval.py --num-cpus 4 --output-dir eval_results
-```
-
-Compare result rows ignoring row order:
-
-```bash
-python eval.py --ignore-order --output-dir eval_results
-```
-
-Expected output:
-
-- Per-query files such as `eval_results/544_movies_4_eval.json`
-- Summary file: `eval_results/summary.json`
-
-Each per-query eval file contains:
-
-- `correct_set`: SQL candidates whose execution result matches gold SQL.
-- `wrong_set`: SQL candidates whose execution result does not match gold SQL.
-- `file_errors`: file-level evaluation errors, if any.
-
-## 4. Run `sql_to_ast.py`
-
-Convert one eval result file to AST JSON:
-
-```bash
-python sql_to_ast.py eval_results/544_movies_4_eval.json -o eval_results_ast/544_movies_4_ast.json --dialect sqlite
-```
-
-Convert all eval result files:
-
-```bash
-python sql_to_ast.py eval_results -o eval_results_ast --pattern '*_eval.json' --dialect sqlite
-```
-
-Deduplicate SQL strings inside each set before parsing:
-
-```bash
-python sql_to_ast.py eval_results -o eval_results_ast --pattern '*_eval.json' --dialect sqlite --deduplicate
-```
-
-Print a single converted file to stdout:
-
-```bash
-python sql_to_ast.py eval_results/544_movies_4_eval.json --dialect sqlite
-```
-
-Expected output:
+文件内容应为 JSON 列表，每条记录里包含 `all_sqls`：
 
 ```json
-{
-  "metadata": {
-    "sample_id": 544,
-    "db_id": "movies_4",
-    "source_file": "eval_results/544_movies_4_eval.json",
-    "gold_count": 1,
-    "correct_count": 5,
-    "wrong_count": 7,
-    "parsed_gold_count": 1,
-    "parsed_correct_count": 5,
-    "parsed_wrong_count": 6,
-    "parsed_count": 12,
-    "error_count": 1
-  },
-  "gold": [
-    {
-      "sql": "...",
-      "normalized_sql": "..."
-    }
-  ],
-  "correct": [
-    {
-      "sql": "...",
-      "normalized_sql": "..."
-    }
-  ],
-  "wrong": [
-    {
-      "sql": "...",
-      "normalized_sql": "..."
-    }
-  ],
-  "errors": []
-}
+[
+  {
+    "all_sqls": [
+      "SELECT ...",
+      "SELECT ..."
+    ]
+  }
+]
 ```
 
-Each `normalized_sql` is produced by parsing with sqlglot and re-serializing.
-To compute distance metrics, re-parse it with `sqlglot.parse_one(normalized_sql)`.
+`eval.py` 会从文件名里取出 `544`，并默认使用 `train.json[544]` 作为对应样本。
 
-For directory input, files are mapped like this:
+## 4. 配置 `.location`
+
+在仓库根目录创建 `.location`：
+
+```ini
+TRAIN_DATA_PATH=/data/sql2ast/train/train.json
+TRAIN_DATABASE_PATH=/data/sql2ast/train/train_databases
+SQL_PATH=/data/sql2ast/candidates
+EVAL_OUTPUT_PATH=/data/sql2ast/eval_results
+```
+
+字段说明：
+
+- `TRAIN_DATA_PATH`
+  训练集 JSON 路径
+- `TRAIN_DATABASE_PATH`
+  SQLite 数据库根目录
+- `SQL_PATH`
+  候选 SQL 文件或目录
+- `EVAL_OUTPUT_PATH`
+  `eval.py` 的输出目录，可选，不填时默认 `eval_results`
+
+## 5. 完整流程总览
+
+完整流程建议按下面顺序执行：
 
 ```text
-eval_results/544_movies_4_eval.json -> eval_results_ast/544_movies_4_ast.json
+1. 安装依赖
+2. 配置 .location
+3. 执行 eval.py，得到 eval_results
+4. 执行 sql_to_ast.py，得到 eval_results_ast
+5. 执行 calibrate.py，检查距离函数质量
+6. 执行 build_pairs.py，生成 dpo_pairs.jsonl
+7. 执行 train_sft.py，得到 outputs/sft
+8. 执行 train_dpo.py，得到 outputs/dpo
+9. 对 SFT / DPO 模型分别做推理与评估
 ```
 
-## 5. Legacy `all_sqls` normalization
+下面按阶段展开。
 
-`sql_to_ast.py` still supports the old sampled SQL format directly:
+## 6. 阶段一：候选 SQL 执行评估
+
+### 6.1 运行命令
+
+最常用命令：
 
 ```bash
-python sql_to_ast.py data/1_movie_platform.json -o data_ast/1_movie_platform_ast.json --dialect sqlite
+python eval.py --output-dir /data/sql2ast/eval_results
 ```
 
-This preserves the original records and adds `normalized_sqls` (a list of
-`{"sql": "...", "normalized_sql": "..."}` objects, one per unique SQL string).
-
-## 6. Typical Full Workflow
+常见可选参数：
 
 ```bash
+python eval.py --limit 5 --output-dir /data/sql2ast/eval_results
+python eval.py --ignore-order --output-dir /data/sql2ast/eval_results
+python eval.py --num-cpus 8 --output-dir /data/sql2ast/eval_results
+```
+
+参数说明：
+
+- `--limit`
+  只处理前 N 个文件，适合冒烟测试
+- `--ignore-order`
+  比较结果集时忽略行顺序
+- `--num-cpus`
+  并行执行候选 SQL 的 CPU worker 数
+
+### 6.2 输出内容
+
+每个样本会生成一个 `*_eval.json`，例如：
+
+```text
+/data/sql2ast/eval_results/544_movies_4_eval.json
+```
+
+同时会生成汇总文件：
+
+```text
+/data/sql2ast/eval_results/summary.json
+```
+
+单个 `*_eval.json` 里主要包含：
+
+- `correct_set`
+  执行结果与 gold SQL 一致的候选
+- `wrong_set`
+  执行结果与 gold SQL 不一致的候选
+- `metadata`
+  样本级元信息
+- `file_errors`
+  文件级报错
+
+这一步是后续所有 AST 分析、pair 构造、DPO 训练的基础。
+
+## 7. 阶段二：SQL 规范化与 AST 导出
+
+### 7.1 运行命令
+
+将整个 `eval_results` 目录转换为 AST 输出：
+
+```bash
+python sql_to_ast.py /data/sql2ast/eval_results \
+  -o /data/sql2ast/eval_results_ast \
+  --pattern '*_eval.json' \
+  --dialect sqlite
+```
+
+如果希望对每个集合内部先去重：
+
+```bash
+python sql_to_ast.py /data/sql2ast/eval_results \
+  -o /data/sql2ast/eval_results_ast \
+  --pattern '*_eval.json' \
+  --dialect sqlite \
+  --deduplicate
+```
+
+### 7.2 输出内容
+
+会生成例如：
+
+```text
+/data/sql2ast/eval_results_ast/544_movies_4_ast.json
+```
+
+文件中会包含：
+
+- `gold`
+- `correct`
+- `wrong`
+- 每条 SQL 对应的 `normalized_sql`
+- 解析失败信息 `errors`
+
+这一步主要用于：
+
+- 验证 SQL 是否可被 `sqlglot` 解析
+- 统一 SQL 表达形式
+- 为距离函数和误差分析提供更稳定输入
+
+## 8. 阶段三：校准距离函数
+
+这一步不是必须，但强烈建议在正式构造 DPO 数据前先执行。
+
+### 8.1 运行命令
+
+```bash
+python src/calibrate.py \
+  --eval-dir /data/sql2ast/eval_results \
+  --train-data /data/sql2ast/train/train.json \
+  --database-root /data/sql2ast/train/train_databases \
+  --output /data/sql2ast/reports/distance_calibration.json
+```
+
+### 8.2 作用
+
+该脚本会统计：
+
+- AST 距离与执行正确性的 Spearman 相关性
+- 正样本和负样本的平均距离
+- AUC 等指标
+
+如果距离函数与执行正确性几乎没有相关性，那么基于该距离构造的 DPO 数据质量会受影响。
+
+## 9. 阶段四：构造 DPO 偏好数据
+
+### 9.1 运行命令
+
+```bash
+python src/build_pairs.py \
+  --eval-dir /data/sql2ast/eval_results \
+  --train-data /data/sql2ast/train/train.json \
+  --database-root /data/sql2ast/train/train_databases \
+  --output /data/sql2ast/data/dpo_pairs.jsonl
+```
+
+如果只想先跑少量样本：
+
+```bash
+python src/build_pairs.py \
+  --eval-dir /data/sql2ast/eval_results \
+  --train-data /data/sql2ast/train/train.json \
+  --database-root /data/sql2ast/train/train_databases \
+  --output /data/sql2ast/data/dpo_pairs.jsonl \
+  --limit 100
+```
+
+### 9.2 输出内容
+
+输出文件：
+
+```text
+/data/sql2ast/data/dpo_pairs.jsonl
+```
+
+每行通常包含：
+
+- `prompt`
+- `chosen`
+- `rejected`
+- `margin`
+- `sample_id`
+- `db_id`
+
+### 9.3 重要说明
+
+当前仓库的 `build_pairs.py` 是按 AST 距离排序后构造 pair。正式训练前，建议你先人工抽样检查 `chosen/rejected` 是否符合预期，尤其要确认：
+
+- `chosen` 是否稳定来自执行正确的候选
+- `rejected` 是否稳定来自执行错误的候选
+
+如果你打算把这份仓库用于正式实验，建议优先保证“执行正确性”决定正负标签，再让 AST 距离参与排序、筛选 hard negative 和定义 `margin`。
+
+## 10. 阶段五：SFT 训练
+
+### 10.1 修改配置
+
+先编辑 [`configs/sft.yaml`](configs/sft.yaml)，至少确认这几个字段：
+
+```yaml
+model_name_or_path: "Qwen/Qwen2.5-Coder-7B-Instruct"
+train_data_path: "/data/sql2ast/train/train.json"
+database_root: "/data/sql2ast/train/train_databases"
+output_dir: "/data/sql2ast/outputs/sft"
+```
+
+### 10.2 单机 8 卡启动
+
+推荐在 Linux 服务器上使用 `torchrun`：
+
+```bash
+torchrun --nproc_per_node=8 src/train_sft.py --config configs/sft.yaml
+```
+
+如果只想先试单卡冒烟：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python src/train_sft.py --config configs/sft.yaml
+```
+
+### 10.3 默认配置含义
+
+默认 `configs/sft.yaml` 中：
+
+- `per_device_train_batch_size: 4`
+- `gradient_accumulation_steps: 4`
+
+单卡有效 batch size 为：
+
+```text
+4 x 4 = 16
+```
+
+8 卡总有效 batch size 为：
+
+```text
+4 x 4 x 8 = 128
+```
+
+对 8 x A100 40G 来说，Qwen2.5-Coder-7B + LoRA + bf16 通常是合理起点。如果显存仍然紧张，可以优先降低：
+
+- `per_device_train_batch_size`
+- `max_seq_length`
+
+### 10.4 训练产物
+
+训练完成后，默认输出到：
+
+```text
+/data/sql2ast/outputs/sft
+```
+
+该目录会作为下一阶段 DPO 的初始模型。
+
+## 11. 阶段六：DPO 训练
+
+### 11.1 修改配置
+
+编辑 [`configs/dpo.yaml`](configs/dpo.yaml)，至少确认：
+
+```yaml
+model_name_or_path: "/data/sql2ast/outputs/sft"
+ref_model_name_or_path: null
+dpo_pairs_path: "/data/sql2ast/data/dpo_pairs.jsonl"
+output_dir: "/data/sql2ast/outputs/dpo"
+```
+
+### 11.2 单机 8 卡启动
+
+```bash
+torchrun --nproc_per_node=8 src/train_dpo.py --config configs/dpo.yaml
+```
+
+### 11.3 默认配置含义
+
+默认 `configs/dpo.yaml` 中：
+
+- `per_device_train_batch_size: 2`
+- `gradient_accumulation_steps: 8`
+
+单卡有效 batch size 为：
+
+```text
+2 x 8 = 16
+```
+
+8 卡总有效 batch size 为：
+
+```text
+2 x 8 x 8 = 128
+```
+
+其中关键超参数：
+
+- `beta`
+  DPO 中参考模型约束强度
+- `alpha`
+  额外加入 AST 距离 `margin` 的权重
+
+当前实现的 DPO loss 形式为：
+
+```text
+L = -log(sigmoid(beta * (policy_logratio - ref_logratio) + alpha * margin))
+```
+
+也就是说：
+
+- SFT 阶段不使用 AST 距离
+- DPO 阶段才会使用 `margin`
+
+### 11.4 训练产物
+
+训练完成后，默认输出到：
+
+```text
+/data/sql2ast/outputs/dpo
+```
+
+## 12. 推荐的完整命令顺序
+
+下面是一套适合 Linux 云服务器的完整执行顺序。请先按你的实际路径修改。
+
+```bash
+# 1) 安装依赖
 pip install -r requirements.txt
+pip install pyyaml datasets transformers peft trl accelerate sentencepiece
+pip install scipy scikit-learn
 
-python eval.py --output-dir eval_results
+# 2) 执行候选 SQL 评估
+python eval.py --output-dir /data/sql2ast/eval_results --num-cpus 8
 
-python sql_to_ast.py eval_results -o eval_results_ast --pattern '*_eval.json' --dialect sqlite
+# 3) 导出 AST / 规范化 SQL
+python sql_to_ast.py /data/sql2ast/eval_results \
+  -o /data/sql2ast/eval_results_ast \
+  --pattern '*_eval.json' \
+  --dialect sqlite
+
+# 4) 校准距离函数
+python src/calibrate.py \
+  --eval-dir /data/sql2ast/eval_results \
+  --train-data /data/sql2ast/train/train.json \
+  --database-root /data/sql2ast/train/train_databases \
+  --output /data/sql2ast/reports/distance_calibration.json
+
+# 5) 构造 DPO 数据
+python src/build_pairs.py \
+  --eval-dir /data/sql2ast/eval_results \
+  --train-data /data/sql2ast/train/train.json \
+  --database-root /data/sql2ast/train/train_databases \
+  --output /data/sql2ast/data/dpo_pairs.jsonl
+
+# 6) 先做 SFT
+torchrun --nproc_per_node=8 src/train_sft.py --config configs/sft.yaml
+
+# 7) 再做 DPO
+torchrun --nproc_per_node=8 src/train_dpo.py --config configs/dpo.yaml
 ```
 
-After this workflow:
+## 13. 建议的实验节奏
 
-- `eval_results/` contains execution-evaluation results.
-- `eval_results_ast/` contains gold/correct/wrong SQL with normalized forms.
+为了避免在大机器上长时间跑错配置，建议按下面节奏推进：
+
+1. 先用 `--limit 5` 跑 `eval.py`
+2. 检查 `summary.json` 和几个 `*_eval.json`
+3. 再跑 `sql_to_ast.py`
+4. 抽样检查 AST 转换结果和 parse error
+5. 先用少量样本跑 `build_pairs.py`
+6. 抽样检查 `dpo_pairs.jsonl`
+7. 单卡跑 SFT / DPO 冒烟
+8. 最后切到 8 卡正式训练
+
+这样可以显著减少大规模训练前的无效消耗。
+
+## 14. 常见问题
+
+### 14.1 为什么 `requirements.txt` 很短？
+
+因为它当前只覆盖 AST 相关基础依赖，没有覆盖训练依赖。训练前请按本文档额外安装：
+
+- `pyyaml`
+- `datasets`
+- `transformers`
+- `peft`
+- `trl`
+- `accelerate`
+- `scipy`
+- `scikit-learn`
+- `torch`
+
+### 14.2 为什么 SFT 要先于 DPO？
+
+因为 DPO 假设模型已经具备基本生成能力。这个仓库的默认配置也是让 `src/train_dpo.py` 从 `outputs/sft` 继续训练。
+
+### 14.3 AST 距离在哪个阶段生效？
+
+当前代码中：
+
+- SFT 不使用 AST 距离
+- DPO 数据构造和 DPO loss 会使用 AST 距离
+
+### 14.4 是否可以直接开始正式 DPO？
+
+不建议。请先人工检查 `dpo_pairs.jsonl` 的质量，确认正负样本方向符合你的训练目标。
+
+## 15. 当前仓库的已知注意点
+
+在正式大规模实验前，建议你额外注意下面几点：
+
+- 当前测试基线不是全绿，建议先执行 `pytest -q`
+- `src/build_pairs.py` 当前的 pair 构造策略更适合作为实验起点，不建议未经抽样验证就直接用于正式训练
+- 训练脚本默认使用 LoRA 和 bf16，比较适合 A100 40G，但具体 batch size 仍建议先单卡冒烟确认
+
+## 16. 最终闭环
+
+这套仓库的完整链路可以概括为：
+
+```text
+候选 SQL -> 执行评估 -> AST/距离分析 -> 构造偏好数据 -> SFT -> DPO
+```
+
+如果你后续还要做正式 benchmark，建议再补充一套“模型生成测试集 SQL -> 执行评估”的推理脚本，把训练闭环和测试闭环完全接上。
