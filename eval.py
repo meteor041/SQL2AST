@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import multiprocessing as mp
 import re
 import sys
@@ -13,11 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from cscsql.utils.file_utils import FileUtils
+from cscsql.utils.logger_utils import logger
 from cscsql.utils.sqlite_db_utils import SqliteDbUtils
 from tqdm import tqdm
 
 
 SAMPLE_FILE_RE = re.compile(r"^(\d+)_.*\.json$")
+EVAL_WORKER_CONTEXT: dict[str, Any] = {}
 
 # 输出类型定义
 # rows: 查询结果的行数据，列表中的每个元素都是一个行数据列表
@@ -111,6 +114,22 @@ def resolve_output_dir(args: argparse.Namespace, location: dict[str, str]) -> Pa
         or "eval_results"
     )
     return Path(output_dir)
+
+
+def configure_eval_logging(log_path: Path) -> Path:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(pathname)s[%(lineno)d]: %(message)s"
+    )
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    return log_path
 
 
 def sample_id_from_path(path: Path) -> int:
@@ -259,7 +278,7 @@ def run_clusters_parallel(
     num_cpus: int,
 ) -> list[dict[str, Any]]:
     cluster_items = list(clusters.values())
-    if num_cpus <= 1:
+    if num_cpus <= 1 or len(cluster_items) <= 1:
         return [
             execute_cluster_model(
                 cluster_index=cluster_index,
@@ -270,20 +289,16 @@ def run_clusters_parallel(
             for cluster_index, cluster in enumerate(cluster_items)
         ]
 
-    results: list[dict[str, Any]] = []
-
-    def result_callback(result: dict[str, Any]) -> None:
-        results.append(result)
-
-    pool = mp.Pool(processes=num_cpus)
-    for cluster_index, cluster in enumerate(cluster_items):
-        pool.apply_async(
+    ctx = mp.get_context("spawn")
+    worker_count = min(num_cpus, len(cluster_items))
+    with ctx.Pool(processes=worker_count) as pool:
+        results = pool.starmap(
             execute_cluster_model,
-            args=(cluster_index, cluster, sqlite_path, timeout),
-            callback=result_callback,
+            [
+                (cluster_index, cluster, sqlite_path, timeout)
+                for cluster_index, cluster in enumerate(cluster_items)
+            ],
         )
-    pool.close()
-    pool.join()
 
     return sort_cluster_results(results)
 
@@ -319,6 +334,65 @@ def make_output_path(output_dir: Path, file_path: Path) -> Path:
 def write_json(path: Path, data: dict[str, Any]) -> None:
     if not FileUtils.dump_json(str(path), data, indent=2):
         raise OSError(f"Failed to write JSON file: {path}")
+
+
+def make_sample_result(
+    file_path: Path,
+    sample_id: int,
+    sql_path: Path,
+    output_dir: Path,
+    log_path: Path,
+    location_path: Path,
+    train_data_path: Path,
+    database_root: Path,
+    timeout: float,
+    num_cpus: int,
+    ignore_order: bool,
+    correct_records: list[dict[str, Any]],
+    wrong_records: list[dict[str, Any]],
+    file_error: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "sample_file": str(file_path),
+            "sample_id": sample_id,
+            "sql_path": str(sql_path),
+            "output_dir": str(output_dir),
+            "log_file": str(log_path),
+            "location": str(location_path),
+            "train_data_path": str(train_data_path),
+            "train_database_path": str(database_root),
+            "timeout": timeout,
+            "num_cpus": num_cpus,
+            "compare_mode": "ignore_order" if ignore_order else "strict_order",
+            "correct_count": len(correct_records),
+            "wrong_count": len(wrong_records),
+            "file_error_count": 1 if file_error is not None else 0,
+        },
+        "correct_set": correct_records,
+        "wrong_set": wrong_records,
+        "file_errors": [file_error] if file_error is not None else [],
+    }
+
+
+def make_file_summary(
+    file_index: int,
+    file_path: Path,
+    sample_id: int,
+    output_path: Path,
+    correct_records: list[dict[str, Any]],
+    wrong_records: list[dict[str, Any]],
+    file_error: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "file_index": file_index,
+        "file": str(file_path),
+        "sample_id": sample_id,
+        "output_path": str(output_path),
+        "correct_count": len(correct_records),
+        "wrong_count": len(wrong_records),
+        "file_error": file_error,
+    }
 
 
 def evaluate_file(
@@ -414,6 +488,107 @@ def evaluate_file(
     return correct_records, wrong_records, None
 
 
+def evaluate_and_write_file(
+    file_index: int,
+    file_path: Path,
+    train_data: list[dict[str, Any]],
+    database_root: Path,
+    timeout: float,
+    ignore_order: bool,
+    cluster_num_cpus: int,
+    sql_path: Path,
+    output_dir: Path,
+    log_path: Path,
+    location_path: Path,
+    train_data_path: Path,
+    requested_num_cpus: int,
+) -> dict[str, Any]:
+    sample_id = sample_id_from_path(file_path)
+    correct_records, wrong_records, file_error = evaluate_file(
+        file_path=file_path,
+        train_data=train_data,
+        database_root=database_root,
+        timeout=timeout,
+        ignore_order=ignore_order,
+        num_cpus=cluster_num_cpus,
+    )
+    sample_result = make_sample_result(
+        file_path=file_path,
+        sample_id=sample_id,
+        sql_path=sql_path,
+        output_dir=output_dir,
+        log_path=log_path,
+        location_path=location_path,
+        train_data_path=train_data_path,
+        database_root=database_root,
+        timeout=timeout,
+        num_cpus=requested_num_cpus,
+        ignore_order=ignore_order,
+        correct_records=correct_records,
+        wrong_records=wrong_records,
+        file_error=file_error,
+    )
+    output_path = make_output_path(output_dir, file_path)
+    write_json(output_path, sample_result)
+    return make_file_summary(
+        file_index=file_index,
+        file_path=file_path,
+        sample_id=sample_id,
+        output_path=output_path,
+        correct_records=correct_records,
+        wrong_records=wrong_records,
+        file_error=file_error,
+    )
+
+
+def init_eval_worker(
+    train_data: list[dict[str, Any]],
+    database_root: Path,
+    timeout: float,
+    ignore_order: bool,
+    sql_path: Path,
+    output_dir: Path,
+    log_path: Path,
+    location_path: Path,
+    train_data_path: Path,
+    requested_num_cpus: int,
+) -> None:
+    global EVAL_WORKER_CONTEXT
+    configure_eval_logging(log_path)
+    EVAL_WORKER_CONTEXT = {
+        "train_data": train_data,
+        "database_root": database_root,
+        "timeout": timeout,
+        "ignore_order": ignore_order,
+        "sql_path": sql_path,
+        "output_dir": output_dir,
+        "log_path": log_path,
+        "location_path": location_path,
+        "train_data_path": train_data_path,
+        "requested_num_cpus": requested_num_cpus,
+    }
+
+
+def evaluate_file_task(task: tuple[int, str]) -> dict[str, Any]:
+    file_index, raw_file_path = task
+    file_path = Path(raw_file_path)
+    return evaluate_and_write_file(
+        file_index=file_index,
+        file_path=file_path,
+        train_data=EVAL_WORKER_CONTEXT["train_data"],
+        database_root=EVAL_WORKER_CONTEXT["database_root"],
+        timeout=EVAL_WORKER_CONTEXT["timeout"],
+        ignore_order=EVAL_WORKER_CONTEXT["ignore_order"],
+        cluster_num_cpus=1,
+        sql_path=EVAL_WORKER_CONTEXT["sql_path"],
+        output_dir=EVAL_WORKER_CONTEXT["output_dir"],
+        log_path=EVAL_WORKER_CONTEXT["log_path"],
+        location_path=EVAL_WORKER_CONTEXT["location_path"],
+        train_data_path=EVAL_WORKER_CONTEXT["train_data_path"],
+        requested_num_cpus=EVAL_WORKER_CONTEXT["requested_num_cpus"],
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Cluster sampled SQL by text and evaluate by SQLite execution."
@@ -435,7 +610,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--location", type=Path, default=Path(".location"))
     parser.add_argument("--timeout", type=float, default=30.0)
-    parser.add_argument("--num-cpus", type=int, default=1)
+    parser.add_argument(
+        "--num-cpus",
+        type=int,
+        default=1,
+        help=(
+            "Total worker processes to use. When evaluating multiple sample files, "
+            "workers are applied across files; when evaluating a single file, "
+            "workers are applied across SQL clusters."
+        ),
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument(
         "--ignore-order",
@@ -447,83 +631,128 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.num_cpus < 1:
+        raise SystemExit("--num-cpus must be at least 1")
 
     location = parse_location(args.location)
     train_data_path = Path(location["TRAIN_DATA_PATH"])
     database_root = Path(location["TRAIN_DATABASE_PATH"])
     sql_path = args.input_dir or Path(location["SQL_PATH"])
     output_dir = resolve_output_dir(args, location)
-    train_data = load_train_data(train_data_path)
-    sample_files = discover_sample_files(sql_path, limit=args.limit)
+    log_path = output_dir / "eval.log"
 
     if output_dir.exists() and not output_dir.is_dir():
         raise SystemExit(f"Output path exists and is not a directory: {output_dir}")
 
+    if log_path.exists():
+        log_path.unlink()
+    configure_eval_logging(log_path)
+
+    train_data = load_train_data(train_data_path)
+    sample_files = discover_sample_files(sql_path, limit=args.limit)
+
+    logger.info(
+        "Starting evaluation: sample_files=%s num_cpus=%s sql_path=%s output_dir=%s",
+        len(sample_files),
+        args.num_cpus,
+        sql_path,
+        output_dir,
+    )
+
     total_correct_count = 0
     total_wrong_count = 0
-    file_errors: list[dict[str, Any]] = []
-    output_files: list[str] = []
+    total_file_error_count = 0
+    completed_files: list[dict[str, Any]] = []
 
-    with tqdm(
-        sample_files,
-        total=len(sample_files),
-        desc="Evaluating samples",
-        unit="file",
-        file=sys.stderr,
-    ) as progress:
-        for file_path in progress:
-            sample_id = sample_id_from_path(file_path)
-            progress.set_postfix(sample_id=sample_id, refresh=False)
+    if len(sample_files) > 1 and args.num_cpus > 1:
+        worker_count = min(args.num_cpus, len(sample_files))
+        tasks = [(index, str(file_path)) for index, file_path in enumerate(sample_files)]
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=worker_count,
+            initializer=init_eval_worker,
+            initargs=(
+                train_data,
+                database_root,
+                args.timeout,
+                args.ignore_order,
+                sql_path,
+                output_dir,
+                log_path,
+                args.location,
+                train_data_path,
+                args.num_cpus,
+            ),
+        ) as pool, tqdm(
+            total=len(tasks),
+            desc="Evaluating samples",
+            unit="file",
+            file=sys.stderr,
+        ) as progress:
+            for file_summary in pool.imap_unordered(evaluate_file_task, tasks):
+                completed_files.append(file_summary)
+                total_correct_count += file_summary["correct_count"]
+                total_wrong_count += file_summary["wrong_count"]
+                if file_summary["file_error"] is not None:
+                    total_file_error_count += 1
+                progress.update(1)
+                progress.set_postfix(
+                    sample_id=file_summary["sample_id"],
+                    correct=total_correct_count,
+                    wrong=total_wrong_count,
+                    errors=total_file_error_count,
+                    refresh=False,
+                )
+    else:
+        with tqdm(
+            sample_files,
+            total=len(sample_files),
+            desc="Evaluating samples",
+            unit="file",
+            file=sys.stderr,
+        ) as progress:
+            for file_index, file_path in enumerate(progress):
+                file_summary = evaluate_and_write_file(
+                    file_index=file_index,
+                    file_path=file_path,
+                    train_data=train_data,
+                    database_root=database_root,
+                    timeout=args.timeout,
+                    ignore_order=args.ignore_order,
+                    cluster_num_cpus=args.num_cpus,
+                    sql_path=sql_path,
+                    output_dir=output_dir,
+                    log_path=log_path,
+                    location_path=args.location,
+                    train_data_path=train_data_path,
+                    requested_num_cpus=args.num_cpus,
+                )
+                completed_files.append(file_summary)
+                total_correct_count += file_summary["correct_count"]
+                total_wrong_count += file_summary["wrong_count"]
+                if file_summary["file_error"] is not None:
+                    total_file_error_count += 1
+                progress.set_postfix(
+                    sample_id=file_summary["sample_id"],
+                    correct=total_correct_count,
+                    wrong=total_wrong_count,
+                    errors=total_file_error_count,
+                    refresh=False,
+                )
 
-            correct_records, wrong_records, file_error = evaluate_file(
-                file_path=file_path,
-                train_data=train_data,
-                database_root=database_root,
-                timeout=args.timeout,
-                ignore_order=args.ignore_order,
-                num_cpus=args.num_cpus,
-            )
-            total_correct_count += len(correct_records)
-            total_wrong_count += len(wrong_records)
-            if file_error is not None:
-                file_errors.append(file_error)
-
-            sample_result = {
-                "metadata": {
-                    "sample_file": str(file_path),
-                    "sample_id": sample_id,
-                    "sql_path": str(sql_path),
-                    "output_dir": str(output_dir),
-                    "location": str(args.location),
-                    "train_data_path": str(train_data_path),
-                    "train_database_path": str(database_root),
-                    "timeout": args.timeout,
-                    "num_cpus": args.num_cpus,
-                    "compare_mode": "ignore_order" if args.ignore_order else "strict_order",
-                    "correct_count": len(correct_records),
-                    "wrong_count": len(wrong_records),
-                    "file_error_count": 1 if file_error is not None else 0,
-                },
-                "correct_set": correct_records,
-                "wrong_set": wrong_records,
-                "file_errors": [file_error] if file_error is not None else [],
-            }
-
-            output_path = make_output_path(output_dir, file_path)
-            write_json(output_path, sample_result)
-            output_files.append(str(output_path))
-            progress.set_postfix(
-                sample_id=sample_id,
-                correct=total_correct_count,
-                wrong=total_wrong_count,
-                errors=len(file_errors),
-                refresh=False,
-            )
+    completed_files.sort(key=lambda item: item["file_index"])
+    output_files = [item["output_path"] for item in completed_files]
+    file_errors = [
+        item["file_error"]
+        for item in completed_files
+        if item["file_error"] is not None
+    ]
 
     summary = {
         "metadata": {
             "sql_path": str(sql_path),
             "output_dir": str(output_dir),
+            "log_file": str(log_path),
             "location": str(args.location),
             "train_data_path": str(train_data_path),
             "train_database_path": str(database_root),
@@ -541,10 +770,12 @@ def main(argv: list[str] | None = None) -> int:
 
     write_json(output_dir / "summary.json", summary)
 
-    print(
+    logger.info(
+        "Evaluation completed:\n%s",
         json.dumps(
             {
                 "output_dir": str(output_dir),
+                "log_file": str(log_path),
                 "summary": str(output_dir / "summary.json"),
                 "sample_file_count": len(sample_files),
                 "correct_count": total_correct_count,
@@ -553,7 +784,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             ensure_ascii=False,
             indent=2,
-        )
+        ),
     )
     return 1 if file_errors else 0
 
