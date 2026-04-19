@@ -14,6 +14,7 @@ from typing import Any
 
 from cscsql.utils.file_utils import FileUtils
 from cscsql.utils.sqlite_db_utils import SqliteDbUtils
+from tqdm import tqdm
 
 
 SAMPLE_FILE_RE = re.compile(r"^(\d+)_.*\.json$")
@@ -463,45 +464,61 @@ def main(argv: list[str] | None = None) -> int:
     file_errors: list[dict[str, Any]] = []
     output_files: list[str] = []
 
-    for index, file_path in enumerate(sample_files, start=1):
-        print(f"[{index}/{len(sample_files)}] evaluating {file_path}", file=sys.stderr)
-        correct_records, wrong_records, file_error = evaluate_file(
-            file_path=file_path,
-            train_data=train_data,
-            database_root=database_root,
-            timeout=args.timeout,
-            ignore_order=args.ignore_order,
-            num_cpus=args.num_cpus,
-        )
-        total_correct_count += len(correct_records)
-        total_wrong_count += len(wrong_records)
-        if file_error is not None:
-            file_errors.append(file_error)
+    with tqdm(
+        sample_files,
+        total=len(sample_files),
+        desc="Evaluating samples",
+        unit="file",
+        file=sys.stderr,
+    ) as progress:
+        for file_path in progress:
+            sample_id = sample_id_from_path(file_path)
+            progress.set_postfix(sample_id=sample_id, refresh=False)
 
-        sample_result = {
-            "metadata": {
-                "sample_file": str(file_path),
-                "sample_id": sample_id_from_path(file_path),
-                "sql_path": str(sql_path),
-                "output_dir": str(output_dir),
-                "location": str(args.location),
-                "train_data_path": str(train_data_path),
-                "train_database_path": str(database_root),
-                "timeout": args.timeout,
-                "num_cpus": args.num_cpus,
-                "compare_mode": "ignore_order" if args.ignore_order else "strict_order",
-                "correct_count": len(correct_records),
-                "wrong_count": len(wrong_records),
-                "file_error_count": 1 if file_error is not None else 0,
-            },
-            "correct_set": correct_records,
-            "wrong_set": wrong_records,
-            "file_errors": [file_error] if file_error is not None else [],
-        }
+            correct_records, wrong_records, file_error = evaluate_file(
+                file_path=file_path,
+                train_data=train_data,
+                database_root=database_root,
+                timeout=args.timeout,
+                ignore_order=args.ignore_order,
+                num_cpus=args.num_cpus,
+            )
+            total_correct_count += len(correct_records)
+            total_wrong_count += len(wrong_records)
+            if file_error is not None:
+                file_errors.append(file_error)
 
-        output_path = make_output_path(output_dir, file_path)
-        write_json(output_path, sample_result)
-        output_files.append(str(output_path))
+            sample_result = {
+                "metadata": {
+                    "sample_file": str(file_path),
+                    "sample_id": sample_id,
+                    "sql_path": str(sql_path),
+                    "output_dir": str(output_dir),
+                    "location": str(args.location),
+                    "train_data_path": str(train_data_path),
+                    "train_database_path": str(database_root),
+                    "timeout": args.timeout,
+                    "num_cpus": args.num_cpus,
+                    "compare_mode": "ignore_order" if args.ignore_order else "strict_order",
+                    "correct_count": len(correct_records),
+                    "wrong_count": len(wrong_records),
+                    "file_error_count": 1 if file_error is not None else 0,
+                },
+                "correct_set": correct_records,
+                "wrong_set": wrong_records,
+                "file_errors": [file_error] if file_error is not None else [],
+            }
+
+            output_path = make_output_path(output_dir, file_path)
+            write_json(output_path, sample_result)
+            output_files.append(str(output_path))
+            progress.set_postfix(
+                sample_id=sample_id,
+                correct=total_correct_count,
+                wrong=total_wrong_count,
+                errors=len(file_errors),
+                refresh=False,
+            )
 
     summary = {
         "metadata": {
