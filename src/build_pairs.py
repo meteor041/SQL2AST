@@ -68,13 +68,10 @@ def load_train_item(train_data: list[dict], sample_id: int) -> dict | None:
 
 
 def _resolve_db_path(database_root: Path, db_id: str) -> Path:
-    flat   = database_root / f"{db_id}.sqlite"
     nested = database_root / db_id / f"{db_id}.sqlite"
-    if flat.exists():
-        return flat
     if nested.exists():
         return nested
-    raise FileNotFoundError(f"SQLite DB not found for '{db_id}' under {database_root}")
+    raise FileNotFoundError(f"SQLite DB not found: {nested}")
 
 
 # ── scoring and pairing ───────────────────────────────────────────────────────
@@ -104,52 +101,60 @@ def build_pairs_for_sample(
     prompt_str: str,
     sample_id: int,
     db_id: str,
-    max_pairs: int = 6,
-    min_margin: float = 0.05,
+    max_pairs: int = 0,
+    min_margin: float = 0.0,
 ) -> list[DPOPair]:
     """Construct DPO pairs from scored candidates.
 
     Strategy
     --------
-    - All D=1 (nothing parseable) or all D=0 (all perfect) → skip
-    - Enumerate every (i, j) with i < j (chosen has smaller D)
-    - Keep pairs with margin = D_j − D_i ≥ min_margin
+    - correct → wrong: pair every correct SQL with every wrong SQL
+    - wrong → wrong: pair lower-distance wrong SQL with higher-distance wrong SQL
+    - correct → correct: skip because execution cannot decide a preference
     - Deduplicate by (chosen_sql, rejected_sql)
-    - Return at most max_pairs pairs, sorted by margin descending
+    - Return every pair unless max_pairs > 0, then keep the largest margins
     """
-    distances = [d for _, d, _ in scored]
-    if not distances:
-        return []
-    if all(d >= 1.0 for d in distances) or all(d <= 0.0 for d in distances):
+    if not scored:
         return []
 
     pairs: list[DPOPair] = []
     seen:  set[tuple[str, str]] = set()
-    n = len(scored)
 
-    for i in range(n):
-        sql_c, dist_c, _ = scored[i]
-        for j in range(i + 1, n):
-            sql_r, dist_r, _ = scored[j]
-            margin = dist_r - dist_c
-            if margin < min_margin:
-                continue
-            key = (sql_c, sql_r)
-            if key in seen:
-                continue
-            seen.add(key)
-            pairs.append(DPOPair(
-                prompt=prompt_str,
-                chosen=format_sql_response(sql_c),
-                rejected=format_sql_response(sql_r),
-                margin=round(margin, 4),
-                sample_id=sample_id,
-                db_id=db_id,
-            ))
+    def add_pair(chosen_sql: str, rejected_sql: str, margin: float) -> None:
+        if chosen_sql == rejected_sql:
+            return
+        key = (chosen_sql, rejected_sql)
+        if key in seen:
+            return
+        seen.add(key)
+        pairs.append(DPOPair(
+            prompt=prompt_str,
+            chosen=format_sql_response(chosen_sql),
+            rejected=format_sql_response(rejected_sql),
+            margin=round(max(margin, 0.0), 4),
+            sample_id=sample_id,
+            db_id=db_id,
+        ))
 
-    # Sort by margin descending, take top max_pairs
+    correct = [(sql, dist) for sql, dist, is_correct in scored if is_correct]
+    wrong = [(sql, dist) for sql, dist, is_correct in scored if not is_correct]
+
+    for correct_sql, correct_dist in correct:
+        for wrong_sql, wrong_dist in wrong:
+            add_pair(correct_sql, wrong_sql, wrong_dist - correct_dist)
+
+    wrong_sorted = sorted(wrong, key=lambda item: item[1])
+    for i, (chosen_sql, chosen_dist) in enumerate(wrong_sorted):
+        for rejected_sql, rejected_dist in wrong_sorted[i + 1:]:
+            margin = rejected_dist - chosen_dist
+            if margin <= 0.0 or margin < min_margin:
+                continue
+            add_pair(chosen_sql, rejected_sql, margin)
+
     pairs.sort(key=lambda p: p.margin, reverse=True)
-    return pairs[:max_pairs]
+    if max_pairs > 0:
+        return pairs[:max_pairs]
+    return pairs
 
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
@@ -238,8 +243,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output",         type=Path, default=Path("data/dpo_pairs.jsonl"))
     p.add_argument("--train-data",     type=Path, required=True)
     p.add_argument("--database-root",  type=Path, required=True)
-    p.add_argument("--max-pairs",      type=int,  default=6)
-    p.add_argument("--min-margin",     type=float, default=0.05)
+    p.add_argument("--max-pairs",      type=int,  default=0,
+                   help="Maximum pairs per sample; 0 means keep all pairable pairs.")
+    p.add_argument("--min-margin",     type=float, default=0.0,
+                   help="Minimum distance gap for wrong-vs-wrong pairs.")
     p.add_argument("--dialect",        default="sqlite")
     p.add_argument("--limit",          type=int,  default=None,
                    help="Process only the first N eval files (for debugging).")
