@@ -331,12 +331,12 @@ python src/build_pairs.py \
 
 ### 9.3 重要说明
 
-当前仓库的 `build_pairs.py` 是按 AST 距离排序后构造 pair。正式训练前，建议你先人工抽样检查 `chosen/rejected` 是否符合预期，尤其要确认：
+当前仓库的 `build_pairs.py` 会构造两类 pair：
 
-- `chosen` 是否稳定来自执行正确的候选
-- `rejected` 是否稳定来自执行错误的候选
+- `(correct, wrong)`：执行正确 SQL 作为 `chosen`，执行错误 SQL 作为 `rejected`
+- `(wrong, wrong)`：两条都执行错误时，AST 距离更小的 SQL 作为 `chosen`，距离更大的 SQL 作为 `rejected`
 
-如果你打算把这份仓库用于正式实验，建议优先保证“执行正确性”决定正负标签，再让 AST 距离参与排序、筛选 hard negative 和定义 `margin`。
+默认会保留所有可配对 pair；如果设置 `--max-pairs` 为大于 0 的值，则按 `margin` 降序截断。`correct -> wrong` 即使 wrong 的 AST 距离更小，也仍然保持 correct 作为 `chosen`，此时 `margin` 记为 0。
 
 ## 10. 阶段五：SFT 训练
 
