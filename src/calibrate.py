@@ -32,13 +32,10 @@ EVAL_FILE_RE = re.compile(r"^(\d+)_.*_eval\.json$")
 
 
 def _resolve_db_path(database_root: Path, db_id: str) -> Path:
-    flat   = database_root / f"{db_id}.sqlite"
     nested = database_root / db_id / f"{db_id}.sqlite"
-    if flat.exists():
-        return flat
     if nested.exists():
         return nested
-    raise FileNotFoundError(f"DB not found for '{db_id}'")
+    raise FileNotFoundError(f"DB not found: {nested}")
 
 
 def load_distance_correctness_pairs(
