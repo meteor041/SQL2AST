@@ -264,10 +264,11 @@ D = 0.5 * d_comp + 0.3 * d_ted + 0.2 * d_sch
 
 **配对算法**：
 1. 对 correct_set + wrong_set 中的每条候选 SQL，计算 `D(candidate, gold)`
-2. 全排列 C(n,2) 对，chosen 取 D 更小的，rejected 取 D 更大的
-3. 筛选条件：`margin = D_rejected - D_chosen ≥ 0.05`
-4. 按 margin 降序，每条 query 最多保留 6 对
-5. 跳过全 D=0 或全 D=1 的 query（无信号）
+2. `correct -> wrong`：每条执行正确 SQL 都和每条执行错误 SQL 配对
+3. `wrong -> wrong`：执行错误 SQL 之间按距离排序，距离更小者作为 chosen，距离更大者作为 rejected
+4. 跳过 `correct -> correct`，因为执行结果无法给出偏好方向
+5. `margin = max(D_rejected - D_chosen, 0)`；`wrong -> wrong` 距离相等时跳过
+6. 默认保留所有可配对 pair；如设置 `--max-pairs > 0`，按 margin 降序截断
 
 **输出 JSONL 格式**：
 ```json
