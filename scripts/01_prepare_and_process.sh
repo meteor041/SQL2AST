@@ -16,7 +16,7 @@ SQL_PATH=${CANDIDATE_ROOT}
 EVAL_OUTPUT_PATH=${EVAL_ROOT}
 EOF
 
-python eval.py --output-dir "${EVAL_ROOT}" --num-cpus 8
+python eval.py --output-dir "${EVAL_ROOT}" --num-cpus 64
 
 python sql_to_ast.py "${EVAL_ROOT}" \
   -o "${AST_ROOT}" \
