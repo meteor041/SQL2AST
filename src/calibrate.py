@@ -21,9 +21,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.distance.composite import hierarchical_distance
 from src.utils.schema import load_schema
@@ -49,9 +55,14 @@ def load_distance_correctness_pairs(
 
     ``is_correct`` is 1 if the candidate is in ``correct_set``, else 0.
     """
+    def _eval_file_id(path: Path) -> int:
+        match = EVAL_FILE_RE.match(path.name)
+        assert match is not None
+        return int(match.group(1))
+
     eval_files = sorted(
         (p for p in eval_dir.glob("*_eval.json") if EVAL_FILE_RE.match(p.name)),
-        key=lambda p: int(EVAL_FILE_RE.match(p.name).group(1)),
+        key=_eval_file_id,
     )
     if limit:
         eval_files = eval_files[:limit]
@@ -100,8 +111,13 @@ def spearman_correlation(distances: list[float], correctness: list[int]) -> tupl
     """Return (rho, p_value).  Falls back to a manual implementation if scipy absent."""
     try:
         from scipy.stats import spearmanr
-        rho, p = spearmanr(distances, correctness)
-        return float(rho), float(p)
+
+        result: Any = spearmanr(distances, correctness)
+        rho = _as_float(getattr(result, "statistic", result[0]))
+        p_value = _as_float(getattr(result, "pvalue", result[1]))
+        if math.isnan(rho):
+            return 0.0, None if math.isnan(p_value) else p_value
+        return rho, None if math.isnan(p_value) else p_value
     except ImportError:
         pass
 
@@ -122,6 +138,13 @@ def spearman_correlation(distances: list[float], correctness: list[int]) -> tupl
     d_sq = sum((rd - rc) ** 2 for rd, rc in zip(r_d, r_c))
     rho = 1.0 - (6.0 * d_sq) / (n * (n * n - 1))
     return rho, None
+
+
+def _as_float(value: Any) -> float:
+    """Convert scipy/numpy scalar-like values to a plain float for type checkers."""
+    if hasattr(value, "item"):
+        value = value.item()
+    return float(value)
 
 
 def compute_calibration_report(pairs: list[tuple[float, int]]) -> dict:
@@ -202,5 +225,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).parent.parent))
     raise SystemExit(main())
