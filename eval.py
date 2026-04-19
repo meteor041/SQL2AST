@@ -39,6 +39,12 @@ class QueryResult:
             "error": self.error,
         }
 
+    def to_summary_dict(self) -> dict[str, Any]:
+        return {
+            "row_count": self.row_count,
+            "error": self.error,
+        }
+
 # 获取TRAIN_DATA_PATH、TRAIN_DATABASE_PATH和SQL_PATH的值，并进行基本的验证
 def parse_location(path: Path) -> dict[str, str]:
     if not path.exists():
@@ -181,24 +187,18 @@ def load_sql_clusters(path: Path) -> dict[str, dict[str, Any]]:
 
     return clusters
 
-# 获取sqlite数据库的可能路径，首先是平铺路径（database_root/db_id.sqlite），其次是嵌套路径（database_root/db_id/db_id.sqlite）
+# 获取sqlite数据库路径：database_root/db_id/db_id.sqlite
 def sqlite_path_candidates(database_root: Path, db_id: str) -> list[Path]:
-    flat_path = database_root / f"{db_id}.sqlite"
     nested_path = database_root / db_id / f"{db_id}.sqlite"
-    return [flat_path, nested_path]
+    return [nested_path]
 
-# 检查sqlite数据库文件是否存在，优先使用平铺路径，如果平铺路径不存在则使用嵌套路径，如果两者都不存在则抛出FileNotFoundError
+# 检查sqlite数据库文件是否存在，不存在则抛出FileNotFoundError
 def resolve_sqlite_path(database_root: Path, db_id: str) -> Path:
-    flat_path, nested_path = sqlite_path_candidates(database_root, db_id)
-    if flat_path.exists():
-        return flat_path
-
+    [nested_path] = sqlite_path_candidates(database_root, db_id)
     if nested_path.exists():
         return nested_path
 
-    raise FileNotFoundError(
-        f"SQLite database not found. Tried {flat_path} and {nested_path}"
-    )
+    raise FileNotFoundError(f"SQLite database not found: {nested_path}")
 
 
 def json_value(value: Any) -> Any:
@@ -312,7 +312,11 @@ def make_cluster_record(
     gold_result: QueryResult,
     pred_result: QueryResult,
     is_correct: bool,
+    include_result_rows: bool = False,
 ) -> dict[str, Any]:
+    serialize_result = (
+        QueryResult.to_dict if include_result_rows else QueryResult.to_summary_dict
+    )
     return {
         "sample_id": sample_id,
         "file": str(file_path),
@@ -321,8 +325,8 @@ def make_cluster_record(
         "sql": cluster["sql"],
         "count": cluster["count"],
         "occurrences": cluster["occurrences"],
-        "gold_result": gold_result.to_dict(),
-        "pred_result": pred_result.to_dict(),
+        "gold_result": serialize_result(gold_result),
+        "pred_result": serialize_result(pred_result),
         "is_correct": is_correct,
     }
 
@@ -348,6 +352,7 @@ def make_sample_result(
     timeout: float,
     num_cpus: int,
     ignore_order: bool,
+    include_result_rows: bool,
     correct_records: list[dict[str, Any]],
     wrong_records: list[dict[str, Any]],
     file_error: dict[str, Any] | None,
@@ -365,6 +370,7 @@ def make_sample_result(
             "timeout": timeout,
             "num_cpus": num_cpus,
             "compare_mode": "ignore_order" if ignore_order else "strict_order",
+            "include_result_rows": include_result_rows,
             "correct_count": len(correct_records),
             "wrong_count": len(wrong_records),
             "file_error_count": 1 if file_error is not None else 0,
@@ -402,6 +408,7 @@ def evaluate_file(
     timeout: float,
     ignore_order: bool,
     num_cpus: int,
+    include_result_rows: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
     sample_id = sample_id_from_path(file_path)
     if sample_id >= len(train_data):
@@ -479,6 +486,7 @@ def evaluate_file(
             gold_result=gold_result,
             pred_result=pred_result,
             is_correct=is_correct,
+            include_result_rows=include_result_rows,
         )
         if is_correct:
             correct_records.append(record)
@@ -502,6 +510,7 @@ def evaluate_and_write_file(
     location_path: Path,
     train_data_path: Path,
     requested_num_cpus: int,
+    include_result_rows: bool = False,
 ) -> dict[str, Any]:
     sample_id = sample_id_from_path(file_path)
     correct_records, wrong_records, file_error = evaluate_file(
@@ -511,6 +520,7 @@ def evaluate_and_write_file(
         timeout=timeout,
         ignore_order=ignore_order,
         num_cpus=cluster_num_cpus,
+        include_result_rows=include_result_rows,
     )
     sample_result = make_sample_result(
         file_path=file_path,
@@ -524,6 +534,7 @@ def evaluate_and_write_file(
         timeout=timeout,
         num_cpus=requested_num_cpus,
         ignore_order=ignore_order,
+        include_result_rows=include_result_rows,
         correct_records=correct_records,
         wrong_records=wrong_records,
         file_error=file_error,
@@ -552,6 +563,7 @@ def init_eval_worker(
     location_path: Path,
     train_data_path: Path,
     requested_num_cpus: int,
+    include_result_rows: bool,
 ) -> None:
     global EVAL_WORKER_CONTEXT
     configure_eval_logging(log_path)
@@ -566,6 +578,7 @@ def init_eval_worker(
         "location_path": location_path,
         "train_data_path": train_data_path,
         "requested_num_cpus": requested_num_cpus,
+        "include_result_rows": include_result_rows,
     }
 
 
@@ -586,6 +599,7 @@ def evaluate_file_task(task: tuple[int, str]) -> dict[str, Any]:
         location_path=EVAL_WORKER_CONTEXT["location_path"],
         train_data_path=EVAL_WORKER_CONTEXT["train_data_path"],
         requested_num_cpus=EVAL_WORKER_CONTEXT["requested_num_cpus"],
+        include_result_rows=EVAL_WORKER_CONTEXT["include_result_rows"],
     )
 
 
@@ -625,6 +639,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ignore-order",
         action="store_true",
         help="Compare result rows as multisets instead of strict row order.",
+    )
+    parser.add_argument(
+        "--include-result-rows",
+        action="store_true",
+        help=(
+            "Write full gold/pred result rows into *_eval.json. Disabled by "
+            "default to keep eval output small."
+        ),
     )
     return parser
 
@@ -682,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.location,
                 train_data_path,
                 args.num_cpus,
+                args.include_result_rows,
             ),
         ) as pool, tqdm(
             total=len(tasks),
@@ -726,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
                     location_path=args.location,
                     train_data_path=train_data_path,
                     requested_num_cpus=args.num_cpus,
+                    include_result_rows=args.include_result_rows,
                 )
                 completed_files.append(file_summary)
                 total_correct_count += file_summary["correct_count"]
@@ -759,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
             "timeout": args.timeout,
             "num_cpus": args.num_cpus,
             "compare_mode": "ignore_order" if args.ignore_order else "strict_order",
+            "include_result_rows": args.include_result_rows,
             "sample_file_count": len(sample_files),
             "correct_count": total_correct_count,
             "wrong_count": total_wrong_count,
