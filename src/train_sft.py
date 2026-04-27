@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -77,6 +79,7 @@ def build_sft_dataset(
     database_root: Path,
     tokenizer: Any,
     max_seq_length: int = 2048,
+    log_every: int = 200,
 ) -> Any:
     """Build a HuggingFace Dataset of tokenized (prompt + SQL) sequences.
 
@@ -89,30 +92,56 @@ def build_sft_dataset(
     from src.utils.prompt import format_nl2sql_prompt, format_sql_response
 
     def _resolve_db(db_id: str) -> Path:
-        flat   = database_root / f"{db_id}.sqlite"
+        # flat   = database_root / f"{db_id}.sqlite"
         nested = database_root / db_id / f"{db_id}.sqlite"
-        return flat if flat.exists() else nested
+        # return flat if flat.exists() else nested
+        return nested
 
     records: list[dict[str, list[int]]] = []
+    schema_cache: dict[str, Any] = {}
+    total = len(train_data)
 
-    for item in train_data:
+    # In DDP, all ranks execute preprocessing. Keep logs on rank 0 to avoid noise.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    should_log = local_rank == 0
+    started = time.time()
+    kept = 0
+
+    if should_log:
+        print(f"[SFT] Preprocessing started: total_samples={total}")
+
+    for idx, item in enumerate(train_data, start=1):
         question = item.get("question", "")
         gold_sql = item.get("SQL", "")
         db_id    = item.get("db_id", "")
         evidence = item.get("evidence", "")
 
         if not question or not gold_sql or not db_id:
+            if should_log and (idx % log_every == 0 or idx == total):
+                elapsed = time.time() - started
+                print(
+                    f"[SFT] Preprocessing {idx}/{total} "
+                    f"({idx / max(total, 1) * 100:.1f}%) kept={kept} elapsed={elapsed:.1f}s"
+                )
             continue
 
         try:
-            schema      = load_schema(_resolve_db(db_id))
-            schema_dict = schema_to_prompt_dict(schema)
+            if db_id not in schema_cache:
+                schema = load_schema(_resolve_db(db_id))
+                schema_cache[db_id] = schema_to_prompt_dict(schema)
+            schema_dict = schema_cache[db_id]
         except Exception:
+            if should_log and (idx % log_every == 0 or idx == total):
+                elapsed = time.time() - started
+                print(
+                    f"[SFT] Preprocessing {idx}/{total} "
+                    f"({idx / max(total, 1) * 100:.1f}%) kept={kept} elapsed={elapsed:.1f}s"
+                )
             continue
 
-        prompt      = format_nl2sql_prompt(question, schema_dict, evidence)
+        prompt      = format_nl2sql_prompt(question, schema_dict, evidence).rstrip() + "\n"
         completion  = format_sql_response(gold_sql)
-        full_text   = prompt + " " + completion
+        full_text   = prompt + completion
 
         prompt_ids     = tokenizer.encode(prompt, add_special_tokens=False)
         full_ids       = tokenizer.encode(full_text, add_special_tokens=True,
@@ -127,6 +156,22 @@ def build_sft_dataset(
             "attention_mask": [1] * len(full_ids),
             "labels":         labels,
         })
+        kept += 1
+
+        if should_log and (idx % log_every == 0 or idx == total):
+            elapsed = time.time() - started
+            print(
+                f"[SFT] Preprocessing {idx}/{total} "
+                f"({idx / max(total, 1) * 100:.1f}%) kept={kept} "
+                f"schema_cache={len(schema_cache)} elapsed={elapsed:.1f}s"
+            )
+
+    if should_log:
+        elapsed = time.time() - started
+        print(
+            f"[SFT] Preprocessing finished: kept={kept}/{total}, "
+            f"schema_cache={len(schema_cache)}, elapsed={elapsed:.1f}s"
+        )
 
     return Dataset.from_list(records)
 
@@ -135,8 +180,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="SFT warm-up training for NL2SQL.")
     p.add_argument("--config", type=Path, required=True,
                    help="Path to configs/sft.yaml")
-    # Allow arbitrary --key value overrides
-    p.add_argument("extra", nargs=argparse.REMAINDER)
     return p
 
 
@@ -168,14 +211,19 @@ def _parse_overrides(extra: list[str]) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     try:
         import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
+        from transformers import (
+            AutoTokenizer,
+            AutoModelForCausalLM,
+            DataCollatorForSeq2Seq,
+            Trainer,
+            TrainingArguments,
+        )
         from peft import LoraConfig, get_peft_model, TaskType
-        from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
     except ImportError as exc:
         raise SystemExit(f"Missing training dependency: {exc}")
 
-    args      = build_arg_parser().parse_args(argv)
-    overrides = _parse_overrides(args.extra)
+    args, extra = build_arg_parser().parse_known_args(argv)
+    overrides = _parse_overrides(extra)
     cfg       = load_config(args.config, overrides)
 
     # ── tokenizer & model ──────────────────────────────────────────────────
@@ -228,15 +276,22 @@ def main(argv: list[str] | None = None) -> int:
         seed=cfg.seed,
         dataloader_num_workers=cfg.dataloader_num_workers,
         remove_unused_columns=False,
+        ddp_find_unused_parameters=False,
     )
 
-    trainer = SFTTrainer(
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding=True,
+        label_pad_token_id=-100,
+    )
+
+    trainer = Trainer(
         model=model,
         args=training_args,
+        data_collator=data_collator,
         train_dataset=dataset,
-        tokenizer=tokenizer,
-        max_seq_length=cfg.max_seq_length,
-        dataset_kwargs={"skip_prepare_dataset": True},
+        processing_class=tokenizer,
     )
 
     trainer.train()

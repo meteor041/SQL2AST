@@ -64,10 +64,12 @@ def load_schema(db_path: str | Path) -> DBSchema:
             ]
 
             cursor.execute(f"PRAGMA foreign_key_list([{tbl}])")
-            fks = [
-                (row[3].lower(), row[2].lower(), row[4].lower(), "")
-                for row in cursor.fetchall()
-            ]
+            fks = []
+            for row in cursor.fetchall():
+                from_col, to_table, to_col = row[3], row[2], row[4]
+                if not from_col or not to_table or not to_col:
+                    continue
+                fks.append((from_col.lower(), to_table.lower(), to_col.lower(), ""))
 
             tables[tbl.lower()] = TableSchema(name=tbl, columns=cols, foreign_keys=fks)
 

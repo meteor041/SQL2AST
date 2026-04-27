@@ -77,7 +77,7 @@ def extract_select_cols(ast: exp.Expression) -> list[str]:
 def extract_where_conditions(ast: exp.Expression) -> list[str]:
     """Extract individual WHERE predicates as SQL strings (lowercased)."""
     where = ast.find(exp.Where)
-    if not where:
+    if not where or where.this is None:
         return []
     return [c.sql().lower() for c in _split_and(where.this)]
 
@@ -100,7 +100,12 @@ def extract_orderby_cols(ast: exp.Expression) -> list[str]:
     items: list[str] = []
     for ordered in order.expressions:
         col = ordered.find(exp.Column)
-        col_str = col.name.lower() if col else ordered.this.sql().lower()
+        if col:
+            col_str = col.name.lower()
+        elif ordered.this is not None:
+            col_str = ordered.this.sql().lower()
+        else:
+            continue
         direction = "desc" if ordered.args.get("desc") else "asc"
         items.append(f"({col_str},{direction})")
     return items
@@ -108,14 +113,14 @@ def extract_orderby_cols(ast: exp.Expression) -> list[str]:
 
 def extract_having_conditions(ast: exp.Expression) -> list[str]:
     having = ast.find(exp.Having)
-    if not having:
+    if not having or having.this is None:
         return []
     return [c.sql().lower() for c in _split_and(having.this)]
 
 
 def extract_limit(ast: exp.Expression) -> list[str]:
     limit = ast.find(exp.Limit)
-    if not limit:
+    if not limit or limit.this is None:
         return []
     return [limit.this.sql().lower()]
 

@@ -23,6 +23,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from src.distance.composite import hierarchical_distance
 from src.utils.schema import load_schema, schema_to_prompt_dict
 from src.utils.prompt import format_nl2sql_prompt, format_sql_response
@@ -196,12 +200,26 @@ def process_eval_file(
     sample_id = metadata.get("sample_id")
     db_id     = metadata.get("db_id")
 
-    if not isinstance(sample_id, int) or not isinstance(db_id, str):
-        return [], "missing sample_id or db_id in metadata"
+    if not isinstance(sample_id, int):
+        return [], "missing sample_id"
 
     train_item = load_train_item(train_data, sample_id)
     if train_item is None:
         return [], f"sample_id {sample_id} out of range"
+
+    if not isinstance(db_id, str):
+        for record in data.get("correct_set", []) + data.get("wrong_set", []):
+            candidate_db_id = record.get("db_id")
+            if isinstance(candidate_db_id, str):
+                db_id = candidate_db_id
+                break
+    if not isinstance(db_id, str):
+        candidate_db_id = train_item.get("db_id")
+        if isinstance(candidate_db_id, str):
+            db_id = candidate_db_id
+
+    if not isinstance(sample_id, int) or not isinstance(db_id, str):
+        return [], "missing sample_id or db_id"
 
     question = train_item.get("question", "")
     evidence = train_item.get("evidence", "")
@@ -218,6 +236,8 @@ def process_eval_file(
         if isinstance(record.get("gold_sql"), str):
             gold_sql = record["gold_sql"]
             break
+    if not gold_sql and isinstance(train_item.get("SQL"), str):
+        gold_sql = train_item["SQL"]
     if not gold_sql:
         return [], "no gold_sql found"
 
@@ -227,7 +247,9 @@ def process_eval_file(
     scored = score_sql_candidates(correct_sqls, wrong_sqls, gold_sql, schema, dialect)
 
     schema_dict = schema_to_prompt_dict(schema)
-    prompt_str  = format_nl2sql_prompt(question, schema_dict, evidence)
+    prompt_str  = format_nl2sql_prompt(
+        question, schema_dict, evidence, db_engine=dialect
+    )
 
     pairs = build_pairs_for_sample(
         scored, gold_sql, prompt_str, sample_id, db_id, max_pairs, min_margin,

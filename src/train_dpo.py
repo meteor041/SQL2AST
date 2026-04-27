@@ -94,7 +94,11 @@ def load_dpo_dataset(
         for line in fh:
             line = line.strip()
             if line:
-                records.append(json.loads(line))
+                record = json.loads(line)
+                record["prompt"] = str(record["prompt"]).rstrip() + "\n"
+                record["chosen"] = str(record["chosen"]).strip()
+                record["rejected"] = str(record["rejected"]).strip()
+                records.append(record)
 
     dataset = Dataset.from_list(records)
 
@@ -118,6 +122,13 @@ class MarginAwareDPOTrainer:
         import torch
         import torch.nn.functional as F
         from trl import DPOTrainer
+        from trl.trainer.dpo_trainer import (
+            disable_gradient_checkpointing,
+            entropy_from_logits,
+            is_peft_model,
+            selective_log_softmax,
+            use_adapter,
+        )
 
         class _MarginAwareDPOTrainer(DPOTrainer):
             """DPOTrainer with margin-scaled loss.
@@ -138,11 +149,6 @@ class MarginAwareDPOTrainer:
                 return_outputs: bool = False,
                 num_items_in_batch: int | None = None,
             ) -> Any:
-                # Stash margin before the parent strips unknown keys
-                margin = inputs.pop("margin", None)
-                if margin is not None and not isinstance(margin, torch.Tensor):
-                    margin = torch.tensor(margin, dtype=torch.float32)
-                self._current_margin = margin
                 return super().compute_loss(
                     model, inputs,
                     return_outputs=return_outputs,
@@ -150,31 +156,99 @@ class MarginAwareDPOTrainer:
                        if num_items_in_batch is not None else {}),
                 )
 
-            def dpo_loss(
-                self,
-                policy_chosen_logps:      torch.Tensor,
-                policy_rejected_logps:    torch.Tensor,
-                reference_chosen_logps:   torch.Tensor,
-                reference_rejected_logps: torch.Tensor,
-                reference_free: bool = False,
-            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                pi_logratios  = policy_chosen_logps  - policy_rejected_logps
-                ref_logratios = reference_chosen_logps - reference_rejected_logps
+            def _compute_loss(self, model: Any, inputs: dict[str, Any], return_outputs: bool) -> Any:
+                """TRL 1.2.0 sigmoid DPO loss with an added AST-distance margin."""
+                if any(loss_type != "sigmoid" for loss_type in self.loss_types):
+                    raise ValueError("MarginAwareDPOTrainer currently supports only sigmoid DPO loss.")
 
-                if reference_free:
-                    ref_logratios = torch.zeros_like(pi_logratios)
+                mode = "train" if self.model.training else "eval"
+                margin = inputs.pop("margin", None)
+                if margin is not None and not isinstance(margin, torch.Tensor):
+                    margin = torch.tensor(margin, dtype=torch.float32)
 
-                logits = self.beta * (pi_logratios - ref_logratios)
+                non_model_keys = {"completion_mask", "ref_chosen_logps", "ref_rejected_logps"}
+                model_kwargs = {k: v for k, v in inputs.items() if k not in non_model_keys}
+                model_kwargs["use_cache"] = False
+                outputs = model(**model_kwargs)
 
-                margin = getattr(self, "_current_margin", None)
+                input_ids = inputs["input_ids"]
+                completion_mask = inputs["completion_mask"]
+                shift_logits = outputs.logits[..., :-1, :].contiguous()
+                shift_labels = input_ids[..., 1:].contiguous()
+                shift_completion_mask = completion_mask[..., 1:].contiguous()
+
+                per_token_logps = selective_log_softmax(shift_logits, shift_labels)
+                per_token_logps[shift_completion_mask == 0] = 0.0
+                chosen_logps, rejected_logps = per_token_logps.sum(dim=1).chunk(2, dim=0)
+
+                if self.precompute_ref_logps:
+                    ref_chosen_logps = inputs["ref_chosen_logps"]
+                    ref_rejected_logps = inputs["ref_rejected_logps"]
+                else:
+                    with torch.no_grad(), disable_gradient_checkpointing(
+                        self.model, self.args.gradient_checkpointing_kwargs
+                    ):
+                        if is_peft_model(model) and self.ref_model is None:
+                            unwrapped_model = self.accelerator.unwrap_model(model)
+                            with use_adapter(
+                                unwrapped_model,
+                                adapter_name="ref" if "ref" in unwrapped_model.peft_config else None,
+                            ):
+                                ref_outputs = self.model(**model_kwargs)
+                        else:
+                            ref_outputs = self.ref_model(**model_kwargs)
+
+                    ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
+                    ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
+                    ref_per_token_logps[shift_completion_mask == 0] = 0.0
+                    ref_chosen_logps, ref_rejected_logps = ref_per_token_logps.sum(dim=1).chunk(2, dim=0)
+
+                chosen_logratios = chosen_logps - ref_chosen_logps
+                rejected_logratios = rejected_logps - ref_rejected_logps
+                delta_score = chosen_logratios - rejected_logratios
+
+                logits = self.beta * delta_score
                 if margin is not None:
-                    logits = logits + self._alpha * margin.to(logits.device)
+                    logits = logits + self._alpha * margin.to(logits.device, dtype=logits.dtype)
 
-                losses          = -F.logsigmoid(logits)
-                chosen_rewards  = (self.beta * (policy_chosen_logps  - reference_chosen_logps)).detach()
-                rejected_rewards = (self.beta * (policy_rejected_logps - reference_rejected_logps)).detach()
+                loss = -F.logsigmoid(logits).mean()
 
-                return losses, chosen_rewards, rejected_rewards
+                entropy = entropy_from_logits(shift_logits.detach())
+                entropy = entropy[shift_completion_mask.bool()].mean()
+                entropy = self.accelerator.gather_for_metrics(entropy).mean().item()
+                self._metrics[mode]["entropy"].append(entropy)
+
+                if mode == "train":
+                    num_tokens = self.accelerator.gather_for_metrics(inputs["attention_mask"].sum()).sum().item()
+                    self._total_train_tokens += num_tokens
+                self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
+
+                chosen_rewards = self.beta * chosen_logratios.detach()
+                rejected_rewards = self.beta * rejected_logratios.detach()
+                agg_chosen_rewards = self.accelerator.gather(chosen_rewards)
+                agg_rejected_rewards = self.accelerator.gather(rejected_rewards)
+                self._metrics[mode]["rewards/chosen"].append(agg_chosen_rewards.mean().item())
+                self._metrics[mode]["rewards/rejected"].append(agg_rejected_rewards.mean().item())
+                reward_accuracies = (chosen_rewards > rejected_rewards).float()
+                self._metrics[mode]["rewards/accuracies"].append(
+                    self.accelerator.gather(reward_accuracies).mean().item()
+                )
+                reward_margins = chosen_rewards - rejected_rewards
+                self._metrics[mode]["rewards/margins"].append(
+                    self.accelerator.gather(reward_margins).mean().item()
+                )
+                self._metrics[mode]["logps/chosen"].append(
+                    self.accelerator.gather(chosen_logps).mean().item()
+                )
+                self._metrics[mode]["logps/rejected"].append(
+                    self.accelerator.gather(rejected_logps).mean().item()
+                )
+                if margin is not None:
+                    self._metrics[mode]["margin/ast"].append(
+                        self.accelerator.gather(margin.to(chosen_rewards.device)).mean().item()
+                    )
+
+                return (loss, outputs) if return_outputs else loss
 
         return _MarginAwareDPOTrainer
 
@@ -185,7 +259,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Margin-aware DPO training.")
     p.add_argument("--config", type=Path, required=True,
                    help="Path to configs/dpo.yaml")
-    p.add_argument("extra", nargs=argparse.REMAINDER)
     return p
 
 
@@ -223,8 +296,8 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError as exc:
         raise SystemExit(f"Missing training dependency: {exc}")
 
-    args      = build_arg_parser().parse_args(argv)
-    overrides = _parse_overrides(args.extra)
+    args, extra = build_arg_parser().parse_known_args(argv)
+    overrides = _parse_overrides(extra)
     cfg       = load_config(args.config, overrides)
 
     # ── tokenizer ──────────────────────────────────────────────────────────
@@ -237,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── policy model ───────────────────────────────────────────────────────
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name_or_path,
-        torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
+        dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
         trust_remote_code=True,
     )
 
@@ -258,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     if cfg.ref_model_name_or_path:
         ref_model = AutoModelForCausalLM.from_pretrained(
             cfg.ref_model_name_or_path,
-            torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
+            dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
             trust_remote_code=True,
         )
 
@@ -287,8 +360,8 @@ def main(argv: list[str] | None = None) -> int:
         seed=cfg.seed,
         beta=cfg.beta,
         max_length=cfg.max_seq_length,
-        max_prompt_length=cfg.max_prompt_length,
         remove_unused_columns=False,
+        ddp_find_unused_parameters=False,
     )
 
     TrainerClass = MarginAwareDPOTrainer.make(alpha=cfg.alpha)
@@ -299,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         args=dpo_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
     trainer.train()

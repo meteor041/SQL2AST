@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
+
+
+PROMPT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "template" / "prompt.txt"
+
+
+@lru_cache(maxsize=1)
+def load_prompt_template() -> str:
+    """Load the shared NL2SQL prompt template from disk."""
+    return PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8").strip()
+
 
 def format_schema_section(
     schema_dict: dict[str, list[str]],
@@ -27,6 +39,7 @@ def format_nl2sql_prompt(
     evidence: str = "",
     foreign_keys: list[tuple[str, str, str, str]] | None = None,
     few_shot_examples: list[dict[str, str]] | None = None,
+    db_engine: str = "sqlite",
 ) -> str:
     """Build the full NL2SQL prompt string (no assistant reply).
 
@@ -48,11 +61,16 @@ def format_nl2sql_prompt(
             parts.append(block)
 
     schema_str = format_schema_section(schema_dict, foreign_keys)
-    parts.append(f"Schema:\n{schema_str}")
-    parts.append(f"Question: {question}")
-    if evidence and evidence.strip():
-        parts.append(f"Evidence: {evidence.strip()}")
-    parts.append("SQL:")
+    template = load_prompt_template()
+    prompt_body = template.format(
+        db_engine=db_engine,
+        db_details=schema_str,
+        question=question,
+        # Backward-compatible placeholders if old templates are restored.
+        schema=schema_str,
+        evidence=evidence.strip(),
+    )
+    parts.append(prompt_body.strip())
 
     return "\n\n".join(parts)
 

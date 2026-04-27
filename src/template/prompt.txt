@@ -1,0 +1,20 @@
+Task Overview:
+You are a data science expert. Below, you are provided with a database schema and a natural language question. Your task is to understand the schema and generate a valid SQLite SQL query to answer the question.
+
+Database Engine:
+{db_engine}
+
+Database Schema:
+{db_details}
+This schema describes the database's structure, including tables, columns, primary keys, foreign keys, and any relevant relationships or constraints.
+
+Question:
+{question}
+
+Instructions:
+- Make sure you only output the information that is asked in the question. If the question asks for a specific column, make sure to only include that column in the SELECT clause, nothing more.
+- The generated query should return all of the information asked in the question without any missing or extra information.
+- Only output the final SQLite SQL query, starting with SELECT.
+- Do not include explanations, markdown, code fences, or reasoning.
+
+SQL:
