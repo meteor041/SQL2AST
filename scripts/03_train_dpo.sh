@@ -12,13 +12,13 @@ beta: 0.1
 alpha: 1.0
 
 num_train_epochs: 1
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 8
+per_device_train_batch_size: ${DPO_PER_DEVICE_TRAIN_BATCH_SIZE:-2}
+gradient_accumulation_steps: ${DPO_GRADIENT_ACCUMULATION_STEPS:-8}
 learning_rate: 5.0e-6
 warmup_ratio: 0.1
 lr_scheduler_type: "cosine"
-max_seq_length: 2048
-max_prompt_length: 1536
+max_seq_length: ${DPO_MAX_SEQ_LENGTH:-2048}
+max_prompt_length: ${DPO_MAX_PROMPT_LENGTH:-1536}
 eval_split: 0.05
 
 use_lora: true
@@ -32,7 +32,7 @@ fp16: false
 seed: 42
 logging_steps: 10
 save_steps: 100
-dataloader_num_workers: 2
+dataloader_num_workers: ${DPO_DATALOADER_NUM_WORKERS:-2}
 EOF
 
 LOG_DIR="${DPO_LOG_DIR:-${DPO_OUTPUT}/logs}"

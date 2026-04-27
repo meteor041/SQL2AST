@@ -15,4 +15,5 @@ export PYTHONPATH="${CSC_SQL_ROOT}/src:${PYTHONPATH:-}"
 MODEL_SQL_GENERATE="${DPO_OUTPUT}" \
 PROMPT_NAME="${PROMPT_NAME:-direct}" \
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-none}" \
+N_SQL_GENERATE="${N_SQL_GENERATE:-8}" \
 bash bin/process/run_sql_generate_eval.sh "$@"

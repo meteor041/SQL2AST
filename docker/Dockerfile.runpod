@@ -1,0 +1,37 @@
+FROM vllm/vllm-openai:latest
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    VLLM_USE_MODELSCOPE=False \
+    HF_HOME=/workspace/hf_cache \
+    TRANSFORMERS_CACHE=/workspace/hf_cache \
+    HF_HUB_CACHE=/workspace/hf_cache \
+    TMPDIR=/workspace/tmp
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-17-jdk \
+      git \
+      rsync \
+      rclone \
+      awscli \
+      curl \
+      ca-certificates \
+      build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/requirements-runpod.txt /tmp/requirements-runpod.txt
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir -r /tmp/requirements-runpod.txt \
+    && python - <<'PY'
+import nltk
+nltk.download("punkt")
+PY
+
+RUN mkdir -p /workspace /workspace/tmp /workspace/hf_cache /data/model
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
