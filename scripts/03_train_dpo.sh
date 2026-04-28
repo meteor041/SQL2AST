@@ -5,7 +5,7 @@ source "$(dirname "$0")/00_env.sh"
 cat > configs/dpo.local.yaml <<EOF
 model_name_or_path: "${SFT_OUTPUT}"
 ref_model_name_or_path: null
-dpo_pairs_path: "${DPO_DATA_ROOT}/dpo_pairs.jsonl"
+dpo_pairs_path: "${DPO_PAIRS_PATH:-${DPO_DATA_ROOT}/dpo_pairs.jsonl}"
 output_dir: "${DPO_OUTPUT}"
 
 beta: 0.1

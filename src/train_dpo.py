@@ -100,11 +100,22 @@ def load_dpo_dataset(
                 record["rejected"] = str(record["rejected"]).strip()
                 records.append(record)
 
-    dataset = Dataset.from_list(records)
+    cache_root = Path("/workspace/hf_cache/dpo_raw_dataset")
+    stat = pairs_path.stat()
+    cache_key = f"{pairs_path.name}_{stat.st_size}_{int(stat.st_mtime)}_{eval_split}"
+    cache_dir = cache_root / cache_key
+
+    if cache_dir.exists():
+        from datasets import load_from_disk
+        split = load_from_disk(str(cache_dir))
+    else:
+        dataset = Dataset.from_list(records)
+        split = dataset.train_test_split(test_size=eval_split, seed=42)
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        split.save_to_disk(str(cache_dir))
 
     # TRL DPOTrainer expects the raw text fields; tokenization happens internally.
     # We keep 'margin' as an extra float column.
-    split   = dataset.train_test_split(test_size=eval_split, seed=42)
     return split["train"], split["test"]
 
 

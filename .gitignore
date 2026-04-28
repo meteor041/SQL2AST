@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+configs/*.local.yaml
+
+/outputs/
+/train+eval.sh
+/:
+/PY
+/import
