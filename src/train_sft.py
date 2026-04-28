@@ -56,6 +56,8 @@ class SFTConfig:
     save_steps:            int  = 200
     eval_steps:            int  = 200
     dataloader_num_workers: int  = 4
+    report_to:             str | list[str] | None = "none"
+    run_name:              str | None = None
 
 
 def load_config(config_path: Path, overrides: dict[str, Any] | None = None) -> SFTConfig:
@@ -92,10 +94,11 @@ def build_sft_dataset(
     from src.utils.prompt import format_nl2sql_prompt, format_sql_response
 
     def _resolve_db(db_id: str) -> Path:
-        # flat   = database_root / f"{db_id}.sqlite"
         nested = database_root / db_id / f"{db_id}.sqlite"
-        # return flat if flat.exists() else nested
-        return nested
+        if nested.exists():
+            return nested
+        flat = database_root / f"{db_id}.sqlite"
+        return flat
 
     records: list[dict[str, list[int]]] = []
     schema_cache: dict[str, Any] = {}
@@ -271,12 +274,17 @@ def main(argv: list[str] | None = None) -> int:
         lr_scheduler_type=cfg.lr_scheduler_type,
         bf16=cfg.bf16,
         fp16=cfg.fp16,
+        logging_strategy="steps",
+        logging_first_step=True,
         logging_steps=cfg.logging_steps,
+        save_strategy="steps",
         save_steps=cfg.save_steps,
         seed=cfg.seed,
         dataloader_num_workers=cfg.dataloader_num_workers,
         remove_unused_columns=False,
         ddp_find_unused_parameters=False,
+        report_to=cfg.report_to,
+        run_name=cfg.run_name,
     )
 
     data_collator = DataCollatorForSeq2Seq(
@@ -295,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     trainer.train()
+    trainer.save_state()
     trainer.save_model(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
     print(f"Model saved to {cfg.output_dir}")

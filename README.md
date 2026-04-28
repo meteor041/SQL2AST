@@ -328,6 +328,11 @@ python src/build_pairs.py \
 - `margin`
 - `sample_id`
 - `db_id`
+- `pair_type`
+- `chosen_is_correct`
+- `rejected_is_correct`
+- `chosen_distance`
+- `rejected_distance`
 
 ### 9.3 重要说明
 
@@ -337,6 +342,12 @@ python src/build_pairs.py \
 - `(wrong, wrong)`：两条都执行错误时，AST 距离更小的 SQL 作为 `chosen`，距离更大的 SQL 作为 `rejected`
 
 默认会保留所有可配对 pair；如果设置 `--max-pairs` 为大于 0 的值，则按 `margin` 降序截断。`correct -> wrong` 即使 wrong 的 AST 距离更小，也仍然保持 correct 作为 `chosen`，此时 `margin` 记为 0。
+
+新版本还会把 pair 元数据一起写入 JSONL，便于后续清洗与分层训练：
+
+- `pair_type`: `correct_wrong` 或 `wrong_wrong`
+- `chosen_is_correct` / `rejected_is_correct`: 执行是否正确
+- `chosen_distance` / `rejected_distance`: 相对 gold SQL 的 AST 距离
 
 ## 10. 阶段五：SFT 训练
 
@@ -352,6 +363,14 @@ output_dir: "/data/sql2ast/outputs/sft"
 ```
 
 ### 10.2 单机 8 卡启动
+
+如果你希望 SFT / DPO 自动上报到 Weights & Biases，先复制环境模板并填写密钥：
+
+```bash
+cp configs/wandb.local.env.example configs/wandb.local.env
+```
+
+`scripts/02_train_sft.sh` 和 `scripts/03_train_dpo.sh` 会在启动时自动 `source configs/wandb.local.env`。如果你是直接手写 `torchrun` 命令调用 `src/train_sft.py` / `src/train_dpo.py`，则需要先手动 `source configs/wandb.local.env`，并把 `report_to` 设为 `"wandb"`。
 
 推荐在 Linux 服务器上使用 `torchrun`：
 

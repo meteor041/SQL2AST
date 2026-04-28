@@ -3,9 +3,13 @@ set -euo pipefail
 source "$(dirname "$0")/00_env.sh"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+sft_report_to="${SFT_REPORT_TO:-${TRAIN_REPORT_TO:-none}}"
+sft_run_name="${SFT_RUN_NAME:-sql_rm-sft-${RUN_TIMESTAMP}}"
+
 cat > configs/sft.local.yaml <<EOF
 model_name_or_path: "${MODEL_NAME_OR_PATH:-/data/model/Qwen3-4B-Instruct-2507}"
-train_data_path: "${TRAIN_JSON}"
+train_data_path: "${SFT_TRAIN_DATA_PATH}"
 database_root: "${DB_ROOT}"
 output_dir: "${SFT_OUTPUT}"
 
@@ -30,7 +34,34 @@ logging_steps: 10
 save_steps: 200
 eval_steps: 200
 dataloader_num_workers: ${SFT_DATALOADER_NUM_WORKERS:-0}
+report_to: "${sft_report_to}"
+run_name: "${sft_run_name}"
 EOF
+
+LOG_DIR="${SFT_LOG_DIR:-${SFT_OUTPUT}/logs}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/sft_${RUN_TIMESTAMP}.log"
+CONFIG_SNAPSHOT="${LOG_DIR}/sft_${RUN_TIMESTAMP}.yaml"
+ENV_SNAPSHOT="${LOG_DIR}/sft_${RUN_TIMESTAMP}.env"
+
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+cp configs/sft.local.yaml "${CONFIG_SNAPSHOT}"
+env | sort > "${ENV_SNAPSHOT}"
+
+echo "SFT log file: ${LOG_FILE}"
+echo "SFT config snapshot: ${CONFIG_SNAPSHOT}"
+echo "SFT env snapshot: ${ENV_SNAPSHOT}"
+echo "SFT train data path: ${SFT_TRAIN_DATA_PATH}"
+echo "SFT run name: ${sft_run_name}"
+echo "SFT report_to: ${sft_report_to}"
+if [[ "${sft_report_to}" == "wandb" ]]; then
+  echo "WANDB_PROJECT=${WANDB_PROJECT}"
+  echo "WANDB_DIR=${WANDB_DIR}"
+  echo "WANDB_BASE_URL=${WANDB_BASE_URL:-https://api.wandb.ai}"
+else
+  echo "wandb disabled; set WANDB_API_KEY or TRAIN_REPORT_TO=wandb to enable remote loss curves."
+fi
 
 MASTER_PORT="${MASTER_PORT:-29501}"
 if [[ -n "${NPROC_PER_NODE:-}" ]]; then
@@ -107,4 +138,5 @@ wait_all_gpu_idle() {
 
 wait_all_gpu_idle
 
+echo "Starting SFT training with CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} and nproc_per_node=${nproc_per_node}"
 torchrun --nproc_per_node="${nproc_per_node}" --master_port="${MASTER_PORT}" src/train_sft.py --config configs/sft.local.yaml "$@"

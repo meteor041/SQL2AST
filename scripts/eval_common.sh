@@ -16,6 +16,140 @@ sys.exit(0 if isinstance(data, list) and len(data) > 0 else 1)
 ' "${json_path}"
 }
 
+verify_vllm_runtime() {
+  local python_bin="${PYTHON_BIN:-python3}"
+
+  "${python_bin}" - <<'PY'
+import importlib
+import sys
+
+try:
+    import torch
+except Exception as exc:
+    print(f"Failed to import torch before vLLM preflight: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    importlib.import_module("vllm._C")
+except Exception as exc:
+    print("vLLM runtime preflight failed.", file=sys.stderr)
+    print(f"python={sys.executable}", file=sys.stderr)
+    print(f"torch={torch.__version__}, torch.cuda={torch.version.cuda}", file=sys.stderr)
+    print(f"error={type(exc).__name__}: {exc}", file=sys.stderr)
+
+    err_text = str(exc)
+    if "libcudart.so.13" in err_text:
+        print(
+            "Detected a CUDA runtime mismatch: the installed vllm build expects CUDA 13, "
+            "but this environment only exposes CUDA 12.x libraries.",
+            file=sys.stderr,
+        )
+        print(
+            "Reinstall a CUDA 12.8-compatible vllm build in the active virtualenv before rerunning eval.",
+            file=sys.stderr,
+        )
+    raise SystemExit(1)
+PY
+}
+
+configure_vllm_kernel_env() {
+  export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
+  export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-0}"
+  export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+
+  echo "vLLM kernel settings:"
+  echo "  VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}"
+  echo "  VLLM_MOE_USE_DEEP_GEMM=${VLLM_MOE_USE_DEEP_GEMM}"
+  echo "  VLLM_DEEP_GEMM_WARMUP=${VLLM_DEEP_GEMM_WARMUP}"
+}
+
+wandb_eval_requested() {
+  [[ "${EVAL_REPORT_TO:-${TRAIN_REPORT_TO:-none}}" == "wandb" ]]
+}
+
+print_eval_wandb_status() {
+  local eval_report_to="${EVAL_REPORT_TO:-${TRAIN_REPORT_TO:-none}}"
+
+  if [[ "${eval_report_to}" == "wandb" ]]; then
+    echo "Eval wandb enabled: project=${EVAL_WANDB_PROJECT:-${WANDB_PROJECT}}"
+    echo "Eval wandb dir: ${WANDB_DIR}"
+    echo "Eval wandb base_url: ${WANDB_BASE_URL:-https://api.wandb.ai}"
+  else
+    echo "Eval wandb disabled; set EVAL_REPORT_TO=wandb (or TRAIN_REPORT_TO=wandb) to enable remote eval runs."
+  fi
+}
+
+eval_result_prefix() {
+  local eval_mode="${EVAL_MODE:-major_voting}"
+  local prompt_name="${PROMPT_NAME:-think}"
+  local eval_step="${EVAL_STEP:-sql_generate}"
+  local prefix="sampling"
+
+  if [[ "${eval_mode}" == "greedy_search" ]]; then
+    prefix="greedy_search"
+  fi
+
+  printf "%s_%s_%s" "${prefix}" "${prompt_name}" "${eval_step}"
+}
+
+finalize_eval_wandb() {
+  local exit_code="${1:-0}"
+
+  if [[ "${EVAL_WANDB_FINALIZED:-0}" == "1" ]]; then
+    return 0
+  fi
+  export EVAL_WANDB_FINALIZED=1
+
+  if ! wandb_eval_requested; then
+    return 0
+  fi
+
+  if [[ -z "${RUN_TIME:-}" ]]; then
+    echo "Skip eval wandb logging because RUN_TIME is empty." >&2
+    return 0
+  fi
+
+  local eval_output_dir="${EVAL_OUTPUT_DIR:-}"
+  local eval_prefix="${EVAL_OUTPUT_PREFIX:-}"
+  if [[ -z "${eval_prefix}" ]]; then
+    eval_prefix="$(eval_result_prefix)"
+  fi
+
+  local eval_base_path="${eval_output_dir}/${eval_prefix}"
+  local python_bin="${PYTHON_BIN:-python3}"
+  local strict_flag=()
+  if [[ "${EVAL_WANDB_STRICT:-0}" == "1" || "${EVAL_WANDB_STRICT:-false}" == "true" ]]; then
+    strict_flag+=(--strict)
+  fi
+
+  "${python_bin}" "${PROJECT_ROOT}/src/log_eval_to_wandb.py" \
+    --report-to "${EVAL_REPORT_TO:-${TRAIN_REPORT_TO:-none}}" \
+    --run-name "${EVAL_WANDB_RUN_NAME:-sql_rm-eval-${EVAL_WANDB_STAGE_LABEL:-eval}-${RUN_TIME}}" \
+    --project "${EVAL_WANDB_PROJECT:-${WANDB_PROJECT}}" \
+    --group "${EVAL_WANDB_GROUP:-${WANDB_RUN_GROUP:-}}" \
+    --job-type "${EVAL_WANDB_JOB_TYPE:-eval}" \
+    --stage-label "${EVAL_WANDB_STAGE_LABEL:-eval}" \
+    --run-time "${RUN_TIME}" \
+    --dataset-mode "${DATASET_MODE:-dev}" \
+    --prompt-name "${PROMPT_NAME:-think}" \
+    --eval-mode "${EVAL_MODE:-major_voting}" \
+    --eval-step "${EVAL_STEP:-sql_generate}" \
+    --model-path "${EVAL_MODEL_PATH:-}" \
+    --output-dir "${eval_output_dir}" \
+    --metric-json "${EVAL_METRIC_JSON_PATH:-${eval_base_path}_metric.json}" \
+    --predicted-sql "${EVAL_RESULT_SQL_PATH:-${eval_base_path}_pred_major_voting_sqls.sql}" \
+    --raw-pred-json "${EVAL_RAW_PRED_JSON_PATH:-${eval_base_path}.json}" \
+    --arg-json "${EVAL_ARG_JSON_PATH:-${eval_output_dir}/arg_${EVAL_STEP:-sql_generate}.json}" \
+    --wrapper-log "${EVAL_WRAPPER_LOG_FILE:-}" \
+    --pipeline-log "${EVAL_PIPELINE_LOG_FILE:-}" \
+    --tag "eval" \
+    --tag "${EVAL_WANDB_STAGE_LABEL:-eval}" \
+    --tag "${DATASET_MODE:-dev}" \
+    --tag "${EVAL_MODE:-major_voting}" \
+    --exit-code "${exit_code}" \
+    "${strict_flag[@]}"
+}
+
 wait_all_gpu_idle() {
   if [[ "${WAIT_FOR_GPU_IDLE:-true}" == "false" || "${WAIT_FOR_GPU_IDLE:-true}" == "0" ]]; then
     echo "WAIT_FOR_GPU_IDLE=${WAIT_FOR_GPU_IDLE}; skip waiting for idle GPUs."

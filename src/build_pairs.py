@@ -36,12 +36,17 @@ EVAL_FILE_RE = re.compile(r"^(\d+)_.*_eval\.json$")
 
 @dataclass
 class DPOPair:
-    prompt:    str
-    chosen:    str
-    rejected:  str
-    margin:    float
-    sample_id: int
-    db_id:     str
+    prompt:               str
+    chosen:               str
+    rejected:             str
+    margin:               float
+    sample_id:            int
+    db_id:                str
+    pair_type:            str
+    chosen_is_correct:    bool
+    rejected_is_correct:  bool
+    chosen_distance:      float
+    rejected_distance:    float
 
 
 # ── file discovery ────────────────────────────────────────────────────────────
@@ -75,7 +80,10 @@ def _resolve_db_path(database_root: Path, db_id: str) -> Path:
     nested = database_root / db_id / f"{db_id}.sqlite"
     if nested.exists():
         return nested
-    raise FileNotFoundError(f"SQLite DB not found: {nested}")
+    flat = database_root / f"{db_id}.sqlite"
+    if flat.exists():
+        return flat
+    raise FileNotFoundError(f"SQLite DB not found: {nested} or {flat}")
 
 
 # ── scoring and pairing ───────────────────────────────────────────────────────
@@ -124,7 +132,16 @@ def build_pairs_for_sample(
     pairs: list[DPOPair] = []
     seen:  set[tuple[str, str]] = set()
 
-    def add_pair(chosen_sql: str, rejected_sql: str, margin: float) -> None:
+    def add_pair(
+        chosen_sql: str,
+        rejected_sql: str,
+        margin: float,
+        pair_type: str,
+        chosen_is_correct: bool,
+        rejected_is_correct: bool,
+        chosen_distance: float,
+        rejected_distance: float,
+    ) -> None:
         if chosen_sql == rejected_sql:
             return
         key = (chosen_sql, rejected_sql)
@@ -138,6 +155,11 @@ def build_pairs_for_sample(
             margin=round(max(margin, 0.0), 4),
             sample_id=sample_id,
             db_id=db_id,
+            pair_type=pair_type,
+            chosen_is_correct=chosen_is_correct,
+            rejected_is_correct=rejected_is_correct,
+            chosen_distance=round(chosen_distance, 4),
+            rejected_distance=round(rejected_distance, 4),
         ))
 
     correct = [(sql, dist) for sql, dist, is_correct in scored if is_correct]
@@ -145,7 +167,16 @@ def build_pairs_for_sample(
 
     for correct_sql, correct_dist in correct:
         for wrong_sql, wrong_dist in wrong:
-            add_pair(correct_sql, wrong_sql, wrong_dist - correct_dist)
+            add_pair(
+                correct_sql,
+                wrong_sql,
+                wrong_dist - correct_dist,
+                pair_type="correct_wrong",
+                chosen_is_correct=True,
+                rejected_is_correct=False,
+                chosen_distance=correct_dist,
+                rejected_distance=wrong_dist,
+            )
 
     wrong_sorted = sorted(wrong, key=lambda item: item[1])
     for i, (chosen_sql, chosen_dist) in enumerate(wrong_sorted):
@@ -153,7 +184,16 @@ def build_pairs_for_sample(
             margin = rejected_dist - chosen_dist
             if margin <= 0.0 or margin < min_margin:
                 continue
-            add_pair(chosen_sql, rejected_sql, margin)
+            add_pair(
+                chosen_sql,
+                rejected_sql,
+                margin,
+                pair_type="wrong_wrong",
+                chosen_is_correct=False,
+                rejected_is_correct=False,
+                chosen_distance=chosen_dist,
+                rejected_distance=rejected_dist,
+            )
 
     pairs.sort(key=lambda p: p.margin, reverse=True)
     if max_pairs > 0:
@@ -169,12 +209,17 @@ def write_jsonl(pairs: list[DPOPair], output_path: Path) -> int:
     with output_path.open("a", encoding="utf-8") as fh:
         for p in pairs:
             record = {
-                "prompt":    p.prompt,
-                "chosen":    p.chosen,
-                "rejected":  p.rejected,
-                "margin":    p.margin,
-                "sample_id": p.sample_id,
-                "db_id":     p.db_id,
+                "prompt":               p.prompt,
+                "chosen":               p.chosen,
+                "rejected":             p.rejected,
+                "margin":               p.margin,
+                "sample_id":            p.sample_id,
+                "db_id":                p.db_id,
+                "pair_type":            p.pair_type,
+                "chosen_is_correct":    p.chosen_is_correct,
+                "rejected_is_correct":  p.rejected_is_correct,
+                "chosen_distance":      p.chosen_distance,
+                "rejected_distance":    p.rejected_distance,
             }
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     return len(pairs)
