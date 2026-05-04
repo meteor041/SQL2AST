@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass, fields
@@ -30,6 +32,7 @@ except ImportError:
 class SFTConfig:
     # ── model ──────────────────────────────────────────────────────────────
     model_name_or_path: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
+    attn_implementation: str | None = None
     # ── data ───────────────────────────────────────────────────────────────
     train_data_path: str = ""       # path to BIRD train.json
     database_root:   str = ""       # path to SQLite databases root
@@ -55,6 +58,7 @@ class SFTConfig:
     logging_steps:         int  = 10
     save_steps:            int  = 200
     eval_steps:            int  = 200
+    eval_ratio:            float = 0.0
     dataloader_num_workers: int  = 4
     report_to:             str | list[str] | None = "none"
     run_name:              str | None = None
@@ -90,8 +94,11 @@ def build_sft_dataset(
     """
     from datasets import Dataset
 
-    from src.utils.schema import load_schema, schema_to_prompt_dict
-    from src.utils.prompt import format_nl2sql_prompt, format_sql_response
+    from src.utils.cscsql_prompt import (
+        CSCSQLPromptUnavailableError,
+        build_cscsql_prompt,
+    )
+    from src.utils.prompt import format_sql_response
 
     def _resolve_db(db_id: str) -> Path:
         nested = database_root / db_id / f"{db_id}.sqlite"
@@ -101,7 +108,6 @@ def build_sft_dataset(
         return flat
 
     records: list[dict[str, list[int]]] = []
-    schema_cache: dict[str, Any] = {}
     total = len(train_data)
 
     # In DDP, all ranks execute preprocessing. Keep logs on rank 0 to avoid noise.
@@ -129,10 +135,16 @@ def build_sft_dataset(
             continue
 
         try:
-            if db_id not in schema_cache:
-                schema = load_schema(_resolve_db(db_id))
-                schema_cache[db_id] = schema_to_prompt_dict(schema)
-            schema_dict = schema_cache[db_id]
+            prompt = build_cscsql_prompt(
+                question=question,
+                db_id=db_id,
+                database_root=database_root,
+                evidence=evidence,
+                gold_sql=gold_sql,
+                mode="eval",
+            )
+        except CSCSQLPromptUnavailableError:
+            raise
         except Exception:
             if should_log and (idx % log_every == 0 or idx == total):
                 elapsed = time.time() - started
@@ -142,7 +154,6 @@ def build_sft_dataset(
                 )
             continue
 
-        prompt      = format_nl2sql_prompt(question, schema_dict, evidence).rstrip() + "\n"
         completion  = format_sql_response(gold_sql)
         full_text   = prompt + completion
 
@@ -165,18 +176,49 @@ def build_sft_dataset(
             elapsed = time.time() - started
             print(
                 f"[SFT] Preprocessing {idx}/{total} "
-                f"({idx / max(total, 1) * 100:.1f}%) kept={kept} "
-                f"schema_cache={len(schema_cache)} elapsed={elapsed:.1f}s"
+                f"({idx / max(total, 1) * 100:.1f}%) kept={kept} elapsed={elapsed:.1f}s"
             )
 
     if should_log:
         elapsed = time.time() - started
         print(
             f"[SFT] Preprocessing finished: kept={kept}/{total}, "
-            f"schema_cache={len(schema_cache)}, elapsed={elapsed:.1f}s"
+            f"elapsed={elapsed:.1f}s"
         )
 
     return Dataset.from_list(records)
+
+
+def split_train_eval_data(
+    train_data: list[dict[str, Any]],
+    eval_ratio: float,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Create a deterministic train/eval holdout from raw train.json records."""
+    if eval_ratio <= 0:
+        return train_data, []
+    if eval_ratio >= 1:
+        raise ValueError(f"eval_ratio must be in [0, 1). Got: {eval_ratio}")
+    if len(train_data) < 2:
+        return train_data, []
+
+    eval_count = max(1, math.ceil(len(train_data) * eval_ratio))
+    eval_count = min(eval_count, len(train_data) - 1)
+
+    rng = random.Random(seed)
+    indices = list(range(len(train_data)))
+    rng.shuffle(indices)
+    eval_indices = set(indices[:eval_count])
+
+    train_split: list[dict[str, Any]] = []
+    eval_split: list[dict[str, Any]] = []
+    for idx, item in enumerate(train_data):
+        if idx in eval_indices:
+            eval_split.append(item)
+        else:
+            train_split.append(item)
+
+    return train_split, eval_split
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -239,6 +281,7 @@ def main(argv: list[str] | None = None) -> int:
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name_or_path,
         torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
+        attn_implementation=cfg.attn_implementation,
         trust_remote_code=True,
     )
 
@@ -256,18 +299,40 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── dataset ────────────────────────────────────────────────────────────
     train_data = json.loads(Path(cfg.train_data_path).read_text(encoding="utf-8"))
-    dataset    = build_sft_dataset(
-        train_data,
+    train_records, eval_records = split_train_eval_data(train_data, cfg.eval_ratio, cfg.seed)
+    print(
+        f"[SFT] Raw split: train={len(train_records)} eval={len(eval_records)} "
+        f"total={len(train_data)} eval_ratio={cfg.eval_ratio}"
+    )
+
+    train_dataset = build_sft_dataset(
+        train_records,
         Path(cfg.database_root),
         tokenizer,
         max_seq_length=cfg.max_seq_length,
     )
+    if len(train_dataset) == 0:
+        raise ValueError("SFT train dataset is empty after preprocessing.")
+
+    eval_dataset = None
+    if eval_records:
+        candidate_eval_dataset = build_sft_dataset(
+            eval_records,
+            Path(cfg.database_root),
+            tokenizer,
+            max_seq_length=cfg.max_seq_length,
+        )
+        if len(candidate_eval_dataset) > 0:
+            eval_dataset = candidate_eval_dataset
+        else:
+            print("[SFT] Eval split became empty after preprocessing; disable eval for this run.")
 
     # ── training arguments ─────────────────────────────────────────────────
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         num_train_epochs=cfg.num_train_epochs,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
+        per_device_eval_batch_size=cfg.per_device_train_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         warmup_ratio=cfg.warmup_ratio,
@@ -277,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
         logging_strategy="steps",
         logging_first_step=True,
         logging_steps=cfg.logging_steps,
+        eval_strategy="steps" if eval_dataset is not None else "no",
+        eval_steps=cfg.eval_steps,
         save_strategy="steps",
         save_steps=cfg.save_steps,
         seed=cfg.seed,
@@ -298,7 +365,8 @@ def main(argv: list[str] | None = None) -> int:
         model=model,
         args=training_args,
         data_collator=data_collator,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
     )
 

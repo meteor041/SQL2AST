@@ -28,8 +28,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.distance.composite import hierarchical_distance
-from src.utils.schema import load_schema, schema_to_prompt_dict
-from src.utils.prompt import format_nl2sql_prompt, format_sql_response
+from src.utils.cscsql_prompt import (
+    CSCSQLPromptUnavailableError,
+    build_cscsql_prompt,
+)
+from src.utils.schema import load_schema
+from src.utils.prompt import format_sql_response
 
 EVAL_FILE_RE = re.compile(r"^(\d+)_.*_eval\.json$")
 
@@ -291,10 +295,18 @@ def process_eval_file(
 
     scored = score_sql_candidates(correct_sqls, wrong_sqls, gold_sql, schema, dialect)
 
-    schema_dict = schema_to_prompt_dict(schema)
-    prompt_str  = format_nl2sql_prompt(
-        question, schema_dict, evidence, db_engine=dialect
-    )
+    try:
+        prompt_str = build_cscsql_prompt(
+            question=question,
+            db_id=db_id,
+            database_root=database_root,
+            evidence=evidence,
+            gold_sql=gold_sql,
+            mode="eval",
+            source="ches",
+        )
+    except CSCSQLPromptUnavailableError as exc:
+        return [], f"prompt build error: {exc}"
 
     pairs = build_pairs_for_sample(
         scored, gold_sql, prompt_str, sample_id, db_id, max_pairs, min_margin,
