@@ -14,6 +14,10 @@
   统计 AST 距离与执行正确性的相关性，用于检查距离函数是否可靠。
 - `src/build_pairs.py`
   基于 `eval_results` 构造 DPO 所需的偏好数据 `dpo_pairs.jsonl`。
+- `src/filter_dpo_pairs.py`
+  对全量 DPO pair 做去重、长度过滤和按 prompt 截断，生成可直接训练的 DPO 文件。
+- `src/build_cscsql_contents_index.py`
+  为 `csc_sql` 风格 prompt 构造建立每个数据库的内容检索索引。
 - `src/train_sft.py` / `src/train_dpo.py`
   分别进行 SFT 训练和 DPO 训练。
 
@@ -62,6 +66,14 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 ```
 
 如果服务器环境由平台统一维护，也可以使用平台预装的 PyTorch。
+
+如果你使用当前仓库默认的 `csc_sql` 风格 prompt（`CREATE TABLE ...` + sampled values + question-related DB values），还需要补充：
+
+```bash
+pip install pyserini pyjnius nltk ijson func_timeout
+```
+
+并安装可用的 Java / `javac`。实践中建议使用 OpenJDK 21。
 
 ## 3. 数据目录约定
 
@@ -163,6 +175,62 @@ EVAL_OUTPUT_PATH=/data/sql2ast/eval_results
 8. 执行 train_dpo.py，得到 outputs/dpo
 9. 对 SFT / DPO 模型分别做推理与评估
 ```
+
+### 5.1 当前推荐的 CHES 训练数据工作流（2026-05）
+
+如果你当前跑的是 CHES 这套数据，而不是完全从零搭目录，建议采用下面这套更贴近当前实验状态的工作流：
+
+1. 先为训练库建立 `csc_sql` prompt 所需的 DB 内容索引：
+
+```bash
+python src/build_cscsql_contents_index.py \
+  --database-root /workspace/data/ches/train_databases
+```
+
+默认输出到：
+
+```text
+/workspace/data/ches/train_db_contents_index
+```
+
+2. `SFT` 训练数据推荐直接使用：
+
+```text
+/workspace/data/ches/data/20260428_refresh/sft_augmented.recommended.json
+```
+
+这份文件是“原始 `train.json` + 执行正确 sampled SQL 增广”的推荐集合。  
+`SFT` prompt 在训练时动态构造，所以 **不需要** 重写 JSON；只要索引准备好，训练时就会自动使用 richer prompt。
+
+3. `DPO` 推荐先生成 / 使用 fully indexed 的全量 pair 文件，再过滤为最终训练集。当前推荐的最终训练文件是：
+
+```text
+/workspace/data/ches/data/20260428_refresh/dpo_pairs.strict_mix.cscsql_prompt.2048_2560.jsonl
+```
+
+它的过滤规则是：
+
+- `allowed_pair_types = correct_wrong,wrong_wrong`
+- `min_margin = 0.05`
+- `max_prompt_tokens = 2048`
+- `max_total_tokens = 2560`
+- `max_pairs_per_prompt = 4`
+
+当前统计：
+
+- total pairs: `18,700`
+- `correct_wrong`: `10,042`
+- `wrong_wrong`: `8,658`
+- unique prompts: `4,935`
+
+如果你更关心 prompt 覆盖，`min_margin = 0.03` 也试过，但相比 `0.05` 只多出 `336` 对和 `63` 个 prompt，增益不大，因此当前仍推荐 `0.05`。
+
+4. 如果你要继续做新的 CHES 实验，优先顺序建议是：
+
+- 先建完 `train_db_contents_index`
+- 再重写 `dpo_pairs.with_meta.full.cscsql_prompt.jsonl`
+- 再过滤出最终训练文件
+- 然后重跑 `SFT` / `DPO`
 
 下面按阶段展开。
 
@@ -349,6 +417,23 @@ python src/build_pairs.py \
 - `chosen_is_correct` / `rejected_is_correct`: 执行是否正确
 - `chosen_distance` / `rejected_distance`: 相对 gold SQL 的 AST 距离
 
+### 9.4 当前推荐的 DPO 过滤命令（CHES）
+
+在 fully indexed 的全量 pair 文件已经准备好的前提下，当前推荐的过滤命令是：
+
+```bash
+python src/filter_dpo_pairs.py \
+  --input /workspace/data/ches/data/20260428_refresh/dpo_pairs.with_meta.full.cscsql_prompt.jsonl \
+  --output /workspace/data/ches/data/20260428_refresh/dpo_pairs.strict_mix.cscsql_prompt.2048_2560.jsonl \
+  --summary-json /workspace/data/ches/data/20260428_refresh/dpo_pairs.strict_mix.cscsql_prompt.2048_2560.summary.json \
+  --tokenizer /workspace/models/Qwen3-4B-Instruct-2507 \
+  --allowed-pair-types correct_wrong,wrong_wrong \
+  --min-margin 0.05 \
+  --max-prompt-tokens 2048 \
+  --max-total-tokens 2560 \
+  --max-pairs-per-prompt 4
+```
+
 ## 10. 阶段五：SFT 训练
 
 ### 10.1 修改配置
@@ -361,6 +446,16 @@ train_data_path: "/data/sql2ast/train/train.json"
 database_root: "/data/sql2ast/train/train_databases"
 output_dir: "/data/sql2ast/outputs/sft"
 ```
+
+如果你当前跑的是 CHES 推荐流程，`train_data_path` 建议直接改成：
+
+```yaml
+train_data_path: "/workspace/data/ches/data/20260428_refresh/sft_augmented.recommended.json"
+database_root: "/workspace/data/ches/train_databases"
+```
+
+另外，当前 `src/train_sft.py` 已经不再使用旧的 `Table xxx(...)` 简化 schema prompt，而是通过 `src/utils/cscsql_prompt.py` 复用 `csc_sql` 的 `CREATE TABLE ...` prompt 逻辑。  
+只要 `train_db_contents_index` 已准备好，训练时会自动把 question-related DB values 融入 prompt。
 
 ### 10.2 单机 8 卡启动
 
@@ -429,6 +524,24 @@ model_name_or_path: "/data/sql2ast/outputs/sft"
 ref_model_name_or_path: null
 dpo_pairs_path: "/data/sql2ast/data/dpo_pairs.jsonl"
 output_dir: "/data/sql2ast/outputs/dpo"
+```
+
+如果你当前跑的是 CHES 推荐流程，建议将 `dpo_pairs_path` 指向：
+
+```yaml
+dpo_pairs_path: "/workspace/data/ches/data/20260428_refresh/dpo_pairs.strict_mix.cscsql_prompt.2048_2560.jsonl"
+```
+
+如果你是从 base 模型直接做 DPO，而不是从 `outputs/sft` 继续训练，则把：
+
+```yaml
+model_name_or_path: "/workspace/models/Qwen3-4B-Instruct-2507"
+```
+
+并保留：
+
+```yaml
+ref_model_name_or_path: null
 ```
 
 ### 11.2 单机 8 卡启动
